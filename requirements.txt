@@ -1,0 +1,24 @@
+# orchestration
+langgraph
+langchain-core
+
+# llm providers
+anthropic
+groq
+openai            # OpenRouter is OpenAI-compatible
+
+# research tools
+tavily-python
+trafilatura
+httpx
+
+# mcp (database subagent bridge)
+mcp
+
+# api
+fastapi
+uvicorn[standard]
+sse-starlette
+
+# config
+python-dotenv
