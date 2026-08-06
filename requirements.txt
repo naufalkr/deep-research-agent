@@ -8,6 +8,7 @@ groq
 openai            # OpenRouter is OpenAI-compatible
 
 # research tools
+exa-py
 tavily-python
 trafilatura
 httpx

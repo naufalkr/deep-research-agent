@@ -33,10 +33,16 @@ against it.
 ## Quickstart
 
 ```bash
+python -m venv .venv
+.venv\Scripts\activate        # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
+
 cp .env.example .env          # add your API keys
 
-python -m deepresearch ask "your research question here"
+python -m deepresearch doctor                 # check config, one live call
+python -m deepresearch search "your query"    # search only, no LLM
+python -m deepresearch db "your question"     # database only, via nlquery-agent
+python -m deepresearch ask "your question"    # coming with v0.1-baseline
 ```
 
 ---
