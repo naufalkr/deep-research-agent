@@ -81,7 +81,8 @@ class WebSearch:
         if self.use_cache:
             os.makedirs(CACHE_DIR, exist_ok=True)
             with open(path, "w", encoding="utf-8") as fh:
-                json.dump(raw, fh)
+                # readable on purpose: these files get inspected by hand
+                json.dump(raw, fh, indent=2, ensure_ascii=False)
         return raw
 
     def _call(self, kind: str, key: str, num_results: int) -> list[SearchResult]:

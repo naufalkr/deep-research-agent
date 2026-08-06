@@ -166,3 +166,55 @@ async def test_acomplete_runs_the_same_path(mock_settings):
     reply = await client.acomplete("x", role="lead")
     assert "model-lead" in reply
     assert len(observability.tracker.calls) == 1
+
+
+def test_empty_reply_from_a_truncated_reasoning_model_raises(monkeypatch):
+    """A reasoning model can spend the whole budget thinking and return "" -
+    that must surface as an error, not a silently empty answer."""
+    monkeypatch.setenv("LLM_PROVIDER", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            choice = type(
+                "C",
+                (),
+                {
+                    "message": type("M", (), {"content": ""})(),
+                    "finish_reason": "length",
+                },
+            )()
+            usage = type("U", (), {"prompt_tokens": 1, "completion_tokens": 1})()
+            return type("R", (), {"choices": [choice], "usage": usage})()
+
+    client = LLMClient(settings=Settings.from_env())
+    client._client = type(
+        "C", (), {"chat": type("Ch", (), {"completions": FakeCompletions()})()}
+    )()
+
+    with pytest.raises(llm.TruncatedResponse, match="raise max_tokens"):
+        client.complete("x")
+
+
+def test_a_normal_short_reply_is_not_treated_as_truncated(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            choice = type(
+                "C",
+                (),
+                {
+                    "message": type("M", (), {"content": "ok"})(),
+                    "finish_reason": "length",
+                },
+            )()
+            usage = type("U", (), {"prompt_tokens": 1, "completion_tokens": 1})()
+            return type("R", (), {"choices": [choice], "usage": usage})()
+
+    client = LLMClient(settings=Settings.from_env())
+    client._client = type(
+        "C", (), {"chat": type("Ch", (), {"completions": FakeCompletions()})()}
+    )()
+    assert client.complete("x") == "ok"

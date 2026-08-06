@@ -16,17 +16,26 @@ instead of trusting an article.
 
 Work in progress. Built in phases, tagged as each one lands:
 
-| Tag | Phase | State |
-|---|---|---|
-| `v0.1-baseline` | Single agent, 2 tools — the control group | ☐ |
-| `v0.2-multiagent` | Lead agent + parallel subagents | ☐ |
-| `v0.3-verified` | Critic + separate citation pass | ☐ |
-| `v0.4-evaluated` | Eval harness: accuracy, cost, latency | ☐ |
-| `v0.5-ui` | Web UI with streaming + trace view | ☐ |
-| `v1.0` | Memory, export, Docker | ☐ |
+| Tag | Phase | Passed | Mean | Cost/question |
+|---|---|---|---|---|
+| `v0.1-baseline` | Single agent, 2 tools — the control group | **9/10** | **2.70/3** | **$0.0028** |
+| `v0.2-multiagent` | Lead agent + parallel subagents | ☐ | | |
+| `v0.3-verified` | Critic + separate citation pass | ☐ | | |
+| `v0.4-evaluated` | Full eval harness | ☐ | | |
+| `v0.5-ui` | Web UI with streaming + trace view | ☐ | | |
+| `v1.0` | Memory, export, Docker | ☐ | | |
 
-Phase 1 exists to prove the rest earns its cost — every later tag is measured
-against it.
+Scored on 10 questions (`evals/questions.jsonl`) against DeepSeek V4. Database
+questions are checked by exact match; open-ended ones by an LLM judge.
+
+The baseline exists to prove the rest earns its cost. Its one failure is
+instructive: asked whether Groq's built-in search suits an agent that needs
+citations, it asserted the opposite of what the sources say — a claim no single
+agent cross-checks. That is what `v0.3`'s critic is for.
+
+```bash
+python -m evals.run_eval --tag v0.1-baseline
+```
 
 ---
 

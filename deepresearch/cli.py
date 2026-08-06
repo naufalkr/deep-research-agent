@@ -4,8 +4,10 @@ import argparse
 import asyncio
 
 from . import observability
+from .agents.baseline import BaselineAgent
 from .config import settings
 from .llm import LLMClient
+from .observability import BudgetExceeded
 from .tools.database import DatabaseTool, DatabaseUnavailable
 from .tools.web import WebSearch
 
@@ -86,6 +88,39 @@ def cmd_db(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ask(args: argparse.Namespace) -> int:
+    """Run one research question end to end."""
+    observability.tracker.reset(budget_usd=settings.max_cost_usd_per_run)
+
+    async def run():
+        agent = BaselineAgent(max_steps=args.max_steps)
+        try:
+            async with agent.database.session():
+                return await agent.run(args.question)
+        except DatabaseUnavailable as exc:
+            # A dead database narrows the research, it doesn't end it.
+            print(f"note: database unavailable ({exc}); using web sources only\n")
+            return await agent.run(args.question)
+
+    try:
+        result = asyncio.run(run())
+    except BudgetExceeded as exc:
+        print(f"STOPPED: {exc}")
+        print(observability.tracker.summary())
+        return 1
+
+    print(result.report())
+    if args.trace:
+        print("\n--- steps " + "-" * 33)
+        for i, step in enumerate(result.steps, 1):
+            print(f"  {i}. {step.action:<15} {step.detail[:50]:<52} {step.result}")
+    if not result.ok:
+        print("\n(step budget reached before the agent decided it was done)")
+    print(observability.tracker.summary())
+    observability.tracker.dump("ask")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="deepresearch")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -103,6 +138,12 @@ def main(argv: list[str] | None = None) -> int:
     p_db.add_argument("question", nargs="?", help="omit to print schema instead")
     p_db.add_argument("--database", default="chinook")
     p_db.set_defaults(func=cmd_db)
+
+    p_ask = sub.add_parser("ask", help="research a question end to end")
+    p_ask.add_argument("question")
+    p_ask.add_argument("--max-steps", type=int, default=8)
+    p_ask.add_argument("--trace", action="store_true", help="show the tool calls")
+    p_ask.set_defaults(func=cmd_ask)
 
     args = parser.parse_args(argv)
     return args.func(args)

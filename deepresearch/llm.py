@@ -26,6 +26,10 @@ _BASE_URLS = {
 }
 
 
+class TruncatedResponse(RuntimeError):
+    """The model spent its whole token budget thinking and produced no text."""
+
+
 def _is_retryable(exc: Exception) -> bool:
     name = type(exc).__name__
     if any(k in name for k in ("RateLimit", "Timeout", "Connection", "APIStatus")):
@@ -133,8 +137,13 @@ class LLMClient:
             max_tokens=max_tokens,
             temperature=temperature,
         )
-        return (
-            resp.choices[0].message.content or "",
-            resp.usage.prompt_tokens,
-            resp.usage.completion_tokens,
-        )
+        choice = resp.choices[0]
+        text = choice.message.content or ""
+        # Reasoning models spend max_tokens on thinking before writing anything,
+        # so too small a budget yields an empty string instead of an error.
+        if not text and choice.finish_reason == "length":
+            raise TruncatedResponse(
+                f"{model} used all {max_tokens} tokens on reasoning and returned "
+                f"nothing - raise max_tokens"
+            )
+        return text, resp.usage.prompt_tokens, resp.usage.completion_tokens
