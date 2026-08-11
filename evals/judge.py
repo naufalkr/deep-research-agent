@@ -16,10 +16,12 @@ Reply with a single JSON object and nothing else:
     3  meets the criterion, and the claims that matter carry citations
     2  substantially right, with a gap or an uncited claim
     1  partially right, or right for the wrong reason
-    0  wrong, or invents facts the sources do not support
+    0  wrong, invents facts, or reports nothing at all
 
-An answer that says it could not find something is better than one that makes
-it up: grade honest uncertainty at 2, not 0."""
+Honesty about a gap earns credit only on top of substance. An answer that is
+mostly right and admits one hole is a 2. An answer that gathered nothing and
+says so is a 0 however gracefully it says it — the question was answerable and
+it went unanswered."""
 
 
 @dataclass(frozen=True)

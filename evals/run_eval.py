@@ -18,6 +18,7 @@ from pathlib import Path
 from deepresearch import observability
 from deepresearch.agents.baseline import BaselineAgent
 from deepresearch.config import settings
+from deepresearch.graph import ResearchGraph
 from deepresearch.llm import LLMClient
 from deepresearch.observability import BudgetExceeded
 from deepresearch.tools.database import DatabaseUnavailable
@@ -37,23 +38,37 @@ def load_cases(only: str | None) -> list[dict]:
     return [c for c in cases if not only or c["id"].startswith(only)]
 
 
-async def run_case(case: dict, max_steps: int) -> tuple[str, float, float]:
-    """Returns (answer, cost, seconds). Cost is measured per case, not per run."""
+async def run_case(case: dict, agent: str, max_steps: int) -> dict:
+    """One question, one run. Cost and time are measured per case."""
     observability.tracker.reset(budget_usd=settings.max_cost_usd_per_run)
     start = time.perf_counter()
-    agent = BaselineAgent(max_steps=max_steps)
+    runner = ResearchGraph() if agent == "multiagent" else BaselineAgent(max_steps=max_steps)
     try:
-        async with agent.database.session():
-            result = await agent.run(case["question"])
+        async with runner.database.session():
+            result = await runner.run(case["question"])
     except DatabaseUnavailable:
-        result = await agent.run(case["question"])
+        result = await runner.run(case["question"])
     except BudgetExceeded as exc:
-        return f"[budget exceeded: {exc}]", observability.tracker.total_cost, 0.0
-    return (
-        result.report(),
-        observability.tracker.total_cost,
-        time.perf_counter() - start,
-    )
+        return {
+            "answer": f"[budget exceeded: {exc}]",
+            "cost": observability.tracker.total_cost,
+            "seconds": time.perf_counter() - start,
+        }
+
+    out = {
+        "answer": result.report(),
+        "cost": observability.tracker.total_cost,
+        "seconds": time.perf_counter() - start,
+    }
+    # Without the plan, a failed case can only be diagnosed by reading the prose.
+    if hasattr(result, "plan"):
+        out["plan"] = [
+            {"id": t.id, "tool": t.tool, "objective": t.objective} for t in result.plan
+        ]
+        out["rounds"] = result.rounds
+        out["findings"] = len(result.findings)
+        out["failures"] = result.failures
+    return out
 
 
 async def main() -> int:
@@ -61,6 +76,9 @@ async def main() -> int:
     parser.add_argument("--only", help="run only ids starting with this")
     parser.add_argument("--tag", default="latest", help="name for the saved results")
     parser.add_argument("--max-steps", type=int, default=8)
+    parser.add_argument(
+        "--agent", choices=("baseline", "multiagent"), default="baseline"
+    )
     args = parser.parse_args()
 
     cases = load_cases(args.only)
@@ -70,10 +88,16 @@ async def main() -> int:
 
     judge_llm = LLMClient()
     rows = []
-    print(f"{len(cases)} questions, provider={settings.provider}\n")
+    # flush: piped or backgrounded, a 30-minute sweep would otherwise print
+    # nothing at all until it finished.
+    print(
+        f"{len(cases)} questions, agent={args.agent}, provider={settings.provider}\n",
+        flush=True,
+    )
 
     for case in cases:
-        answer, cost, secs = await run_case(case, args.max_steps)
+        run = await run_case(case, args.agent, args.max_steps)
+        answer, cost, secs = run["answer"], run["cost"], run["seconds"]
         verdict = grade(judge_llm, case, answer)
         rows.append(
             {
@@ -83,13 +107,20 @@ async def main() -> int:
                 "reason": verdict.reason,
                 "cost_usd": round(cost, 5),
                 "seconds": round(secs, 1),
+                **{k: v for k, v in run.items() if k not in ("answer", "cost", "seconds")},
                 "answer": answer,
             }
         )
         mark = "ok  " if verdict.passed else "FAIL"
+        # A run whose subagents died can still read as a graceful answer, so
+        # surface the breakage next to the score rather than only in the file.
+        note = verdict.reason[:60]
+        if run.get("failures"):
+            note = f"[{len(run['failures'])} subagents failed] {note}"
         print(
             f"  {mark} {case['id']:<16} {verdict.score}/3  "
-            f"${cost:.4f}  {secs:>5.1f}s  {verdict.reason[:60]}"
+            f"${cost:.4f}  {secs:>5.1f}s  {note}",
+            flush=True,
         )
 
     total_cost = sum(r["cost_usd"] for r in rows)
@@ -107,6 +138,7 @@ async def main() -> int:
         json.dumps(
             {
                 "tag": args.tag,
+                "agent": args.agent,
                 "provider": settings.provider,
                 "models": {r: settings.model_for(r) for r in ("lead", "critic")},
                 "passed": passed,

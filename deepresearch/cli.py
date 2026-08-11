@@ -5,6 +5,7 @@ import asyncio
 
 from . import observability
 from .agents.baseline import BaselineAgent
+from .graph import ResearchGraph
 from .config import settings
 from .llm import LLMClient
 from .observability import BudgetExceeded
@@ -93,14 +94,16 @@ def cmd_ask(args: argparse.Namespace) -> int:
     observability.tracker.reset(budget_usd=settings.max_cost_usd_per_run)
 
     async def run():
-        agent = BaselineAgent(max_steps=args.max_steps)
+        runner = (
+            ResearchGraph() if args.multiagent else BaselineAgent(max_steps=args.max_steps)
+        )
         try:
-            async with agent.database.session():
-                return await agent.run(args.question)
+            async with runner.database.session():
+                return await runner.run(args.question)
         except DatabaseUnavailable as exc:
             # A dead database narrows the research, it doesn't end it.
             print(f"note: database unavailable ({exc}); using web sources only\n")
-            return await agent.run(args.question)
+            return await runner.run(args.question)
 
     try:
         result = asyncio.run(run())
@@ -111,14 +114,24 @@ def cmd_ask(args: argparse.Namespace) -> int:
 
     print(result.report())
     if args.trace:
-        print("\n--- steps " + "-" * 33)
-        for i, step in enumerate(result.steps, 1):
-            print(f"  {i}. {step.action:<15} {step.detail[:50]:<52} {step.result}")
+        _print_trace(result)
     if not result.ok:
-        print("\n(step budget reached before the agent decided it was done)")
+        print("\n(the agent stopped before it was satisfied)")
     print(observability.tracker.summary())
     observability.tracker.dump("ask")
     return 0
+
+
+def _print_trace(result) -> None:
+    if hasattr(result, "plan"):
+        print(f"\n--- plan ({result.complexity}) " + "-" * 24)
+        for task in result.plan:
+            print(f"  {task.id}  {task.tool:<9} {task.objective[:60]}")
+        print(f"\n  {len(result.findings)} findings from {len(result.plan)} subagents")
+        return
+    print("\n--- steps " + "-" * 33)
+    for i, step in enumerate(result.steps, 1):
+        print(f"  {i}. {step.action:<15} {step.detail[:50]:<52} {step.result}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -143,6 +156,9 @@ def main(argv: list[str] | None = None) -> int:
     p_ask.add_argument("question")
     p_ask.add_argument("--max-steps", type=int, default=8)
     p_ask.add_argument("--trace", action="store_true", help="show the tool calls")
+    p_ask.add_argument(
+        "--multiagent", action="store_true", help="lead agent + parallel subagents"
+    )
     p_ask.set_defaults(func=cmd_ask)
 
     args = parser.parse_args(argv)

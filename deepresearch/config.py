@@ -59,7 +59,7 @@ class Settings:
             nlquery_mcp_args=os.getenv("NLQUERY_MCP_ARGS", ""),
             max_subagents=int(os.getenv("MAX_SUBAGENTS", "5")),
             max_research_rounds=int(os.getenv("MAX_RESEARCH_ROUNDS", "3")),
-            subagent_timeout_s=float(os.getenv("SUBAGENT_TIMEOUT_S", "120")),
+            subagent_timeout_s=float(os.getenv("SUBAGENT_TIMEOUT_S", "300")),
             max_cost_usd_per_run=float(os.getenv("MAX_COST_USD_PER_RUN", "1.00")),
         )
 

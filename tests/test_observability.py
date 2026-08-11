@@ -68,3 +68,35 @@ def test_reset_clears_calls_and_can_set_budget():
     t.reset(budget_usd=2.0)
     assert t.calls == []
     assert t.budget_usd == 2.0
+
+
+def test_elapsed_is_tracked_separately_from_summed_call_time():
+    """With parallel subagents, summed latency overstates the wall clock."""
+    t = Tracker()
+    t.reset()
+    t.record(call(latency=5.0))
+    t.record(call(latency=5.0))
+    assert t.call_seconds == pytest.approx(10.0)
+    assert t.elapsed_s < 1.0
+
+
+def test_the_summary_reports_what_parallelism_saved():
+    t = Tracker()
+    t.reset()
+    t.record(call(latency=5.0))
+    t.record(call(latency=5.0))
+    assert "saved in parallel" in t.summary()
+
+
+def test_sequential_runs_do_not_claim_a_parallel_saving():
+    t = Tracker()
+    t.reset()
+    t.record(call(latency=0.0))
+    assert "saved in parallel" not in t.summary()
+
+
+def test_reset_restarts_the_clock():
+    t = Tracker()
+    first = t.started_at
+    t.reset()
+    assert t.started_at >= first

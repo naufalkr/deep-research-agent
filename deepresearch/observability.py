@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import asdict, dataclass, field
 
 # USD per 1M tokens (input, output). Estimates for budgeting, not billed truth;
@@ -45,6 +46,7 @@ class Call:
 class Tracker:
     calls: list[Call] = field(default_factory=list)
     budget_usd: float = 0.0  # 0 disables the guard
+    started_at: float = field(default_factory=time.perf_counter)
 
     def record(self, call: Call) -> None:
         # Record before checking, so the call that blew the budget stays visible.
@@ -57,8 +59,19 @@ class Tracker:
 
     def reset(self, budget_usd: float | None = None) -> None:
         self.calls = []
+        self.started_at = time.perf_counter()
         if budget_usd is not None:
             self.budget_usd = budget_usd
+
+    @property
+    def elapsed_s(self) -> float:
+        return time.perf_counter() - self.started_at
+
+    @property
+    def call_seconds(self) -> float:
+        """Summed call time. Exceeds elapsed when subagents run in parallel -
+        the gap between the two is what parallelism bought."""
+        return sum(c.latency_s for c in self.calls)
 
     @property
     def total_cost(self) -> float:
@@ -89,8 +102,14 @@ class Tracker:
         lines.append("  " + "-" * 42)
         lines.append(
             f"  {'TOTAL':<20} {len(self.calls):>3} calls  {self.total_tokens:>7} tok  "
-            f"{sum(c.latency_s for c in self.calls):>6.1f}s  ${self.total_cost:.4f}"
+            f"{self.call_seconds:>6.1f}s  ${self.total_cost:.4f}"
         )
+        elapsed = self.elapsed_s
+        if self.call_seconds > elapsed * 1.1:
+            saved = self.call_seconds - elapsed
+            lines.append(
+                f"  {'elapsed':<20} {elapsed:>26.1f}s  ({saved:.0f}s saved in parallel)"
+            )
         if self.unpriced_models:
             lines.append(f"  (no pricing data: {', '.join(self.unpriced_models)})")
         lines.append("-" * 44)

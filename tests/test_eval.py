@@ -55,3 +55,15 @@ def test_a_score_of_two_counts_as_a_pass():
     """Honest uncertainty should not be graded as failure."""
     assert Verdict(2, "").passed
     assert not Verdict(1, "").passed
+
+
+def test_an_empty_answer_scores_zero_not_two_for_honesty():
+    """Reporting nothing gracefully is still reporting nothing."""
+    assert "reports nothing at all" in judge_system()
+    assert "however gracefully" in judge_system()
+
+
+def judge_system():
+    from evals.judge import SYSTEM
+
+    return SYSTEM
