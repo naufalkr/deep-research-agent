@@ -8,6 +8,8 @@ from .config import Role, Settings, settings as default_settings
 from .observability import Call
 
 _MAX_RETRIES = 4
+_MAX_ESCALATIONS = 2   # 3x then 9x the requested budget
+_TOKEN_CEILING = 32000
 
 # These models reject temperature/top_p/top_k with a 400, so they must be omitted.
 _REJECTS_SAMPLING = (
@@ -85,14 +87,25 @@ class LLMClient:
     ) -> str:
         model = self.settings.model_for(role)
         start = time.perf_counter()
-        for attempt in range(_MAX_RETRIES + 1):
+        budget = max_tokens
+        attempt = escalations = 0
+        while True:
             try:
                 text, ptok, ctok = self._call(
-                    model, prompt, system, max_tokens, temperature
+                    model, prompt, system, budget, temperature
                 )
                 break
+            except TruncatedResponse:
+                # How much a reasoning model thinks depends on the input, so no
+                # fixed budget is right for every call. Raise it here rather
+                # than guessing a number at each call site.
+                if escalations >= _MAX_ESCALATIONS:
+                    raise
+                escalations += 1
+                budget = min(budget * 3, _TOKEN_CEILING)
             except Exception as exc:  # noqa: BLE001 - _is_retryable decides
                 if _is_retryable(exc) and attempt < _MAX_RETRIES:
+                    attempt += 1
                     time.sleep(min(2**attempt, 8))
                     continue
                 raise

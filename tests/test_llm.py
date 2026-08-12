@@ -218,3 +218,67 @@ def test_a_normal_short_reply_is_not_treated_as_truncated(monkeypatch):
         "C", (), {"chat": type("Ch", (), {"completions": FakeCompletions()})()}
     )()
     assert client.complete("x") == "ok"
+
+
+class _TruncateThenSucceed:
+    """Truncates until the budget clears `needs`, then answers."""
+
+    def __init__(self, needs: int):
+        self.needs = needs
+        self.budgets = []
+
+    def create(self, **kwargs):
+        budget = kwargs["max_tokens"]
+        self.budgets.append(budget)
+        content = "ok" if budget >= self.needs else ""
+        choice = type(
+            "C",
+            (),
+            {
+                "message": type("M", (), {"content": content})(),
+                "finish_reason": "stop" if content else "length",
+            },
+        )()
+        usage = type("U", (), {"prompt_tokens": 1, "completion_tokens": 1})()
+        return type("R", (), {"choices": [choice], "usage": usage})()
+
+
+def _deepseek_client(monkeypatch, completions):
+    monkeypatch.setenv("LLM_PROVIDER", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client = LLMClient(settings=Settings.from_env())
+    client._client = type(
+        "C", (), {"chat": type("Ch", (), {"completions": completions})()}
+    )()
+    return client
+
+
+def test_a_truncated_reply_is_retried_with_a_bigger_budget(monkeypatch):
+    """Reasoning cost depends on the input, so no fixed budget fits every call."""
+    fake = _TruncateThenSucceed(needs=3000)
+    client = _deepseek_client(monkeypatch, fake)
+    assert client.complete("x", max_tokens=1000) == "ok"
+    assert fake.budgets == [1000, 3000]
+
+
+def test_the_budget_escalates_twice_before_giving_up(monkeypatch):
+    fake = _TruncateThenSucceed(needs=10**9)
+    client = _deepseek_client(monkeypatch, fake)
+    with pytest.raises(llm.TruncatedResponse):
+        client.complete("x", max_tokens=1000)
+    assert fake.budgets == [1000, 3000, 9000]
+
+
+def test_escalation_stops_at_the_ceiling(monkeypatch):
+    fake = _TruncateThenSucceed(needs=10**9)
+    client = _deepseek_client(monkeypatch, fake)
+    with pytest.raises(llm.TruncatedResponse):
+        client.complete("x", max_tokens=20000)
+    assert max(fake.budgets) <= llm._TOKEN_CEILING
+
+
+def test_a_call_that_fits_first_time_is_not_retried(monkeypatch):
+    fake = _TruncateThenSucceed(needs=0)
+    client = _deepseek_client(monkeypatch, fake)
+    assert client.complete("x", max_tokens=1000) == "ok"
+    assert fake.budgets == [1000]
