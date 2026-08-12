@@ -4,10 +4,11 @@ import asyncio
 from dataclasses import dataclass, field
 
 from .agents.lead import Lead
+from .agents.verify import Citer, Critic
 from .agents.subagents import Analyst, Researcher
 from .config import Settings, settings as default_settings
 from .llm import LLMClient
-from .state import Finding, Source, SourceIndex, SubTask
+from .state import Contradiction, Finding, Source, SourceIndex, SubTask
 from .tools.database import DatabaseTool
 from .tools.web import WebSearch
 
@@ -20,6 +21,7 @@ class MultiAgentResult:
     plan: list[SubTask] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
     sources: list[Source] = field(default_factory=list)
+    contradictions: list[Contradiction] = field(default_factory=list)
     failures: dict[str, str] = field(default_factory=dict)
     rounds: int = 1
     ok: bool = True
@@ -48,12 +50,18 @@ class ResearchGraph:
         web: WebSearch | None = None,
         database: DatabaseTool | None = None,
         max_subagents: int | None = None,
+        verify: bool = True,
     ) -> None:
         self.settings = settings or default_settings
         self.llm = llm or LLMClient(settings=self.settings)
         self.web = web  # injected for tests; otherwise one per subagent
         self.database = database or DatabaseTool(self.settings)
         self.lead = Lead(self.settings, llm=self.llm, max_subagents=max_subagents)
+        # Off for the v0.2 comparison, so a phase-3 gain is not mistaken for
+        # a phase-2 one.
+        self.verify = verify
+        self.critic = Critic(self.settings, llm=self.llm, web=self.web)
+        self.citer = Citer(self.settings, llm=self.llm)
 
     async def run(self, question: str) -> MultiAgentResult:
         index = SourceIndex()
@@ -74,7 +82,22 @@ class ResearchGraph:
             plan = plan + gaps
             findings = findings + await self._fan_out(gaps, index, failures)
 
-        answer = await self.lead.synthesize(question, findings, index)
+        # Verification improves a report; losing it should not cost the report.
+        # Both stages degrade to their unverified form, the way a dead subagent
+        # narrows the research instead of ending it.
+        contradictions: list[Contradiction] = []
+        if self.verify:
+            try:
+                findings, contradictions = await self.critic.run(findings, index)
+            except Exception as exc:  # noqa: BLE001 - any critic failure is survivable
+                failures["critic"] = f"{type(exc).__name__}: {exc}"
+
+        answer = await self.lead.synthesize(question, findings, index, contradictions)
+        if self.verify:
+            try:
+                answer = await self.citer.run(answer, findings, index)
+            except Exception as exc:  # noqa: BLE001 - ship it uncited rather than not at all
+                failures["citer"] = f"{type(exc).__name__}: {exc}"
 
         return MultiAgentResult(
             question=question,
@@ -83,6 +106,7 @@ class ResearchGraph:
             plan=plan,
             findings=findings,
             sources=list(index.sources),
+            contradictions=contradictions,
             failures=failures,
             rounds=rounds,
             ok=bool(findings) and not failures,

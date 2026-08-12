@@ -399,3 +399,111 @@ async def test_each_lead_step_gets_its_own_prompt(settings):
     assert "gaps" in seen["review"]
     assert "Write prose" in seen["synthesize"]
     assert "gaps" not in seen["synthesize"]
+
+
+# --- phase 3: critic and citation pass ---
+
+
+def verify_steps():
+    return {
+        **base_steps(),
+        "review": '{"gaps": []}',
+        "verify": json.dumps({"verdicts": [{"n": 1, "verdict": "supported"}]}),
+        "cite": json.dumps({"citations": [{"s": 1, "n": [1]}]}),
+    }
+
+
+async def test_verification_runs_the_critic_then_the_citer(settings):
+    llm = SequencedLLM(verify_steps(), {})
+    await graph(settings, llm).run("q")
+    assert llm.steps.index("verify") < llm.steps.index("synthesize")
+    assert llm.steps.index("synthesize") < llm.steps.index("cite")
+
+
+async def test_verify_off_reproduces_the_v0_2_pipeline(settings):
+    """v0.2's numbers must stay reproducible, or the phase-3 delta is unreadable."""
+    llm = SequencedLLM(verify_steps(), {})
+    await graph(settings, llm, verify=False).run("q")
+    assert "verify" not in llm.steps
+    assert "cite" not in llm.steps
+
+
+async def test_the_critics_verdict_reaches_the_finding(settings):
+    llm = SequencedLLM(verify_steps(), {})
+    result = await graph(settings, llm).run("q")
+    assert result.findings[0].verdict == "supported"
+
+
+async def test_contradictions_are_carried_into_the_result(settings):
+    steps = verify_steps()
+    steps["verify"] = json.dumps(
+        {
+            "verdicts": [{"n": 1, "verdict": "contradicted"}],
+            "contradictions": [{"n": [1, 1], "note": "figures disagree"}],
+        }
+    )
+    llm = SequencedLLM(steps, {})
+    result = await graph(settings, llm).run("q")
+    assert len(result.contradictions) == 1
+    assert "figures disagree" in result.contradictions[0].note
+
+
+async def test_contradictions_are_shown_to_the_writer(settings):
+    steps = verify_steps()
+    steps["verify"] = json.dumps(
+        {"contradictions": [{"n": [1, 1], "note": "figures disagree"}]}
+    )
+    seen = {}
+
+    class Spy(SequencedLLM):
+        async def acomplete(self, prompt, **kwargs):
+            seen[kwargs.get("step")] = prompt
+            return await super().acomplete(prompt, **kwargs)
+
+    await graph(settings, Spy(steps, {})).run("q")
+    assert "figures disagree" in seen["synthesize"]
+
+
+async def test_the_writer_is_told_not_to_cite(settings):
+    """Citing is the citer's job; two agents doing it produces invented numbers."""
+    from deepresearch.agents.lead import REPORT_PROMPT
+
+    assert "Do not add citation markers" in REPORT_PROMPT
+
+
+async def test_a_broken_critic_still_yields_a_report(settings):
+    """Verification improves a report; losing it must not cost the report."""
+
+    class Boom(SequencedLLM):
+        async def acomplete(self, prompt, **kwargs):
+            if kwargs.get("step") == "verify":
+                raise RuntimeError("critic exploded")
+            return await super().acomplete(prompt, **kwargs)
+
+    result = await graph(settings, Boom(verify_steps(), {})).run("q")
+    assert result.answer
+    assert "critic exploded" in result.failures["critic"]
+
+
+async def test_a_broken_citer_ships_the_uncited_report(settings):
+    class Boom(SequencedLLM):
+        async def acomplete(self, prompt, **kwargs):
+            if kwargs.get("step") == "cite":
+                raise RuntimeError("citer exploded")
+            return await super().acomplete(prompt, **kwargs)
+
+    result = await graph(settings, Boom(verify_steps(), {})).run("q")
+    assert result.answer == "report"
+    assert "citer exploded" in result.failures["citer"]
+
+
+async def test_a_broken_critic_does_not_lose_the_findings(settings):
+    class Boom(SequencedLLM):
+        async def acomplete(self, prompt, **kwargs):
+            if kwargs.get("step") == "verify":
+                raise RuntimeError("boom")
+            return await super().acomplete(prompt, **kwargs)
+
+    result = await graph(settings, Boom(verify_steps(), {})).run("q")
+    assert len(result.findings) == 1
+    assert result.findings[0].verdict == "unchecked"

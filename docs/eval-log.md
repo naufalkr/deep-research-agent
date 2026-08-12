@@ -76,12 +76,26 @@ gracefully it says it."*
 
 ---
 
+## Running a sweep
+
+Sweeps take 45-70 minutes with verification on, so they are usually
+backgrounded. Two things make the output readable while it runs:
+
+```bash
+python -m evals.run_eval --agent verified --tag v0.3 2>&1 \
+  | grep --line-buffered -vE "INFO|HTTP Request|server\.py|_client\.py"
+```
+
+- **Keep stderr.** Redirecting it to `/dev/null` to hide the MCP INFO lines also
+  discards tracebacks: one sweep died on an unhandled `TruncatedResponse` and
+  the output file held no clue why.
+- **`--line-buffered`.** Without it grep holds every line in its own buffer and
+  the file stays empty until the sweep ends, which looks identical to a hang.
+
 ## Known issues
 
-- **`plan_queries` truncates on `deepseek-v4-flash`.** Its 2000-token budget is
-  sometimes consumed by reasoning before any JSON is written, and the subagent
-  returns nothing. Surfaces as `TruncatedResponse` in `result.failures`. Raise
-  the planning budget the way `EXTRACT_TOKENS` was raised.
+- ~~**`plan_queries` truncates on `deepseek-v4-flash`.**~~ Fixed: `PLAN_TOKENS`
+  raised to 6000.
 - **A 15-question sweep run across a machine sleep is not comparable.** One case
   took 2397s against 304s in a clean run, and the stalls produced timeouts that
   are artefacts, not behaviour. The hard-question figures above come from the

@@ -95,7 +95,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
 
     async def run():
         runner = (
-            ResearchGraph() if args.multiagent else BaselineAgent(max_steps=args.max_steps)
+            ResearchGraph(verify=not args.no_verify)
+            if args.multiagent
+            else BaselineAgent(max_steps=args.max_steps)
         )
         try:
             async with runner.database.session():
@@ -158,6 +160,9 @@ def main(argv: list[str] | None = None) -> int:
     p_ask.add_argument("--trace", action="store_true", help="show the tool calls")
     p_ask.add_argument(
         "--multiagent", action="store_true", help="lead agent + parallel subagents"
+    )
+    p_ask.add_argument(
+        "--no-verify", action="store_true", help="skip the critic and citation pass"
     )
     p_ask.set_defaults(func=cmd_ask)
 

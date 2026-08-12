@@ -42,7 +42,10 @@ async def run_case(case: dict, agent: str, max_steps: int) -> dict:
     """One question, one run. Cost and time are measured per case."""
     observability.tracker.reset(budget_usd=settings.max_cost_usd_per_run)
     start = time.perf_counter()
-    runner = ResearchGraph() if agent == "multiagent" else BaselineAgent(max_steps=max_steps)
+    if agent == "baseline":
+        runner = BaselineAgent(max_steps=max_steps)
+    else:
+        runner = ResearchGraph(verify=agent == "verified")
     try:
         async with runner.database.session():
             result = await runner.run(case["question"])
@@ -77,7 +80,9 @@ async def main() -> int:
     parser.add_argument("--tag", default="latest", help="name for the saved results")
     parser.add_argument("--max-steps", type=int, default=8)
     parser.add_argument(
-        "--agent", choices=("baseline", "multiagent"), default="baseline"
+        "--agent",
+        choices=("baseline", "multiagent", "verified"),
+        default="baseline",
     )
     args = parser.parse_args()
 

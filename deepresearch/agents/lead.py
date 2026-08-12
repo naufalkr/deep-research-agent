@@ -5,7 +5,7 @@ from pathlib import Path
 
 from ..config import Settings, settings as default_settings
 from ..llm import LLMClient
-from ..state import Finding, SourceIndex, SubTask, render_findings
+from ..state import Contradiction, Finding, SourceIndex, SubTask, render_findings
 from .subagents import parse_json
 
 PROMPTS = Path(__file__).resolve().parent.parent / "prompts"
@@ -126,15 +126,23 @@ class Lead:
         return tasks[: self.max_subagents]
 
     async def synthesize(
-        self, question: str, findings: list[Finding], index: SourceIndex
+        self,
+        question: str,
+        findings: list[Finding],
+        index: SourceIndex,
+        contradictions: list[Contradiction] | None = None,
     ) -> str:
         if not findings:
             return (
                 "The research returned no usable findings, so this question is left "
                 "unanswered rather than answered from guesswork."
             )
+        prompt = f"Question: {question}\n\nFindings:\n\n{render_findings(findings, index)}"
+        if contradictions:
+            clashes = "\n\n".join(c.render() for c in contradictions)
+            prompt += f"\n\nThe critic found these findings in conflict:\n\n{clashes}"
         return await self.llm.acomplete(
-            f"Question: {question}\n\nFindings:\n\n{render_findings(findings, index)}",
+            prompt,
             role="lead",
             system=REPORT_PROMPT,
             agent="lead",

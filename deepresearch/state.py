@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Annotated, Literal, TypedDict
 
 Tool = Literal["web", "database"]
+Verdict = Literal["unchecked", "supported", "unsupported", "contradicted"]
 
 
 @dataclass(frozen=True)
@@ -30,10 +31,25 @@ class Finding:
     source_url: str
     confidence: Literal["high", "medium", "low"] = "medium"
     subtask_id: str = ""
+    verdict: Verdict = "unchecked"
 
     def render(self, n: int | None = None) -> str:
         tag = f"[{n}] " if n else ""
-        return f"{tag}{self.claim}\n    evidence: {self.evidence}\n    confidence: {self.confidence}"
+        line = f"{tag}{self.claim}\n    evidence: {self.evidence}\n    confidence: {self.confidence}"
+        if self.verdict != "unchecked":
+            line += f"\n    verdict: {self.verdict}"
+        return line
+
+
+@dataclass(frozen=True)
+class Contradiction:
+    """Two findings that cannot both be right. Reported, never silently resolved."""
+
+    claims: list[str]
+    note: str
+
+    def render(self) -> str:
+        return f"{self.note}\n" + "\n".join(f"    - {c}" for c in self.claims)
 
 
 @dataclass(frozen=True)
