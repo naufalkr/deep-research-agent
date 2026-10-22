@@ -1,0 +1,16 @@
+services:
+  ui:
+    build: .
+    ports:
+      - "8100:8000"
+    env_file: .env
+    volumes:
+      # Edit on the host, -w reloads inside the container.
+      - ./deepresearch:/app/deepresearch
+      - ./ui:/app/ui
+      - ./runs:/app/runs
+      # The database subagent spawns nlquery-agent, so it has to be reachable.
+      - ../NLQuery-agent:/NLQuery-agent:ro
+    environment:
+      NLQUERY_MCP_ARGS: /NLQuery-agent/mcp_server.py
+    command: chainlit run ui/app.py -h -w --host 0.0.0.0 --port 8000

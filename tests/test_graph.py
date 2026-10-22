@@ -507,3 +507,73 @@ async def test_a_broken_critic_does_not_lose_the_findings(settings):
     result = await graph(settings, Boom(verify_steps(), {})).run("q")
     assert len(result.findings) == 1
     assert result.findings[0].verdict == "unchecked"
+
+
+# --- the progress seam a UI hooks into ---
+
+
+def recorder():
+    seen = []
+
+    async def on_event(kind, data):
+        seen.append((kind, data))
+
+    return seen, on_event
+
+
+async def test_a_run_reports_every_stage(settings):
+    seen, on_event = recorder()
+    llm = SequencedLLM(verify_steps(), {})
+    await graph(settings, llm, on_event=on_event).run("q")
+    kinds = [k for k, _ in seen]
+    assert kinds[0] == "start"
+    for stage in ("planned", "subagent_start", "subagent_done", "reviewed",
+                  "verified", "writing", "cited"):
+        assert stage in kinds, stage
+
+
+async def test_events_carry_what_the_ui_needs_to_draw(settings):
+    seen, on_event = recorder()
+    llm = SequencedLLM(verify_steps(), {})
+    await graph(settings, llm, on_event=on_event).run("q")
+    by_kind = dict(seen)
+    assert by_kind["planned"]["complexity"] == "simple"
+    assert by_kind["planned"]["tasks"][0].id == "t1"
+    assert by_kind["subagent_done"]["task"].id == "t1"
+    assert by_kind["cited"]["markers"] >= 1
+
+
+async def test_a_failing_subagent_is_reported_as_it_happens(settings):
+    class Exploding(WebSearch):
+        def search(self, query, **kw):
+            raise RuntimeError("network died")
+
+    seen, on_event = recorder()
+    llm = SequencedLLM(verify_steps(), {})
+    g = ResearchGraph(
+        settings,
+        llm=llm,
+        web=Exploding(settings, seen_urls=set()),
+        database=DatabaseTool(settings, mock=True),
+        on_event=on_event,
+    )
+    await g.run("q")
+    failed = [d for k, d in seen if k == "subagent_failed"]
+    assert failed and "network died" in failed[0]["reason"]
+
+
+async def test_a_broken_listener_does_not_lose_the_research(settings):
+    """A UI hiccup must not cost the run."""
+
+    async def on_event(kind, data):
+        raise RuntimeError("the UI fell over")
+
+    llm = SequencedLLM(verify_steps(), {})
+    result = await graph(settings, llm, on_event=on_event).run("q")
+    assert result.answer
+
+
+async def test_no_listener_means_no_overhead(settings):
+    llm = SequencedLLM(verify_steps(), {})
+    result = await graph(settings, llm).run("q")
+    assert result.answer

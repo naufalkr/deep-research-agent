@@ -23,3 +23,6 @@ sse-starlette
 
 # config
 python-dotenv
+
+# ui
+chainlit
