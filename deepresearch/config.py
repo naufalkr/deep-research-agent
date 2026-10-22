@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -18,10 +18,10 @@ Role = Literal["lead", "subagent", "critic", "citation"]
 @dataclass(frozen=True)
 class Settings:
     provider: str
-    anthropic_api_key: str
-    deepseek_api_key: str
-    groq_api_key: str
-    openrouter_api_key: str
+    anthropic_api_key: str = field(repr=False)
+    deepseek_api_key: str = field(repr=False)
+    groq_api_key: str = field(repr=False)
+    openrouter_api_key: str = field(repr=False)
 
     lead_model: str
     critic_model: str
@@ -29,11 +29,12 @@ class Settings:
     citation_model: str
 
     search_provider: str
-    exa_api_key: str
-    tavily_api_key: str
+    exa_api_key: str = field(repr=False)
 
     nlquery_mcp_command: str
     nlquery_mcp_args: str
+    nlquery_fast_model: str
+    nlquery_smart_model: str
 
     max_subagents: int
     max_research_rounds: int
@@ -54,9 +55,10 @@ class Settings:
             citation_model=os.getenv("CITATION_MODEL", "deepseek-v4-flash"),
             search_provider=os.getenv("SEARCH_PROVIDER", "exa").lower(),
             exa_api_key=os.getenv("EXA_API_KEY", ""),
-            tavily_api_key=os.getenv("TAVILY_API_KEY", ""),
             nlquery_mcp_command=os.getenv("NLQUERY_MCP_COMMAND", "python"),
             nlquery_mcp_args=os.getenv("NLQUERY_MCP_ARGS", ""),
+            nlquery_fast_model=os.getenv("NLQUERY_FAST_MODEL", ""),
+            nlquery_smart_model=os.getenv("NLQUERY_SMART_MODEL", ""),
             max_subagents=int(os.getenv("MAX_SUBAGENTS", "5")),
             max_research_rounds=int(os.getenv("MAX_RESEARCH_ROUNDS", "3")),
             subagent_timeout_s=float(os.getenv("SUBAGENT_TIMEOUT_S", "300")),
@@ -87,8 +89,6 @@ class Settings:
             gaps.append(f"{self.provider.upper()}_API_KEY")
         if self.search_provider == "exa" and not self.exa_api_key:
             gaps.append("EXA_API_KEY")
-        if self.search_provider == "tavily" and not self.tavily_api_key:
-            gaps.append("TAVILY_API_KEY")
         return gaps
 
 

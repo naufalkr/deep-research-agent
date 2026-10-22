@@ -5,80 +5,59 @@ import asyncio
 
 from . import observability
 from .agents.baseline import BaselineAgent
-from .graph import ResearchGraph
 from .config import settings
+from .graph import ResearchGraph
 from .llm import LLMClient
 from .observability import BudgetExceeded
 from .tools.database import DatabaseTool, DatabaseUnavailable
-from .tools.web import WebSearch
-
-ROLES = ("lead", "critic", "subagent", "citation")
+from .tools.web import CATEGORIES, WebSearch
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Check config and make one live call."""
     provider = args.provider or settings.provider
-    print(f"provider        : {provider}")
-    print(f"search provider : {settings.search_provider}")
-    print("models")
-    for role in ROLES:
-        print(f"  {role:<10} : {settings.model_for(role)}")
+    print(f"provider : {provider}   search : {settings.search_provider}")
+    for role in ("lead", "critic", "subagent", "citation"):
+        print(f"  {role:<9}: {settings.model_for(role)}")
 
     gaps = settings.missing()
-    if provider == "mock":
-        print("\nrunning in mock mode - no API keys needed")
-    elif gaps:
-        print(f"\nmissing config  : {', '.join(gaps)}")
-        print("fill these in .env before a real run")
-    else:
-        print("\nconfig          : all required keys present")
+    if gaps and provider != "mock":
+        print(f"missing  : {', '.join(gaps)} - add to .env")
 
-    print(f"\ncalling {provider} once...")
     observability.tracker.reset(budget_usd=settings.max_cost_usd_per_run)
     try:
-        client = LLMClient(provider=provider)
-        reply = client.complete(
-            "Reply with the single word: ok",
-            role="subagent",
-            agent="doctor",
-            step="smoke",
-            max_tokens=16,
+        reply = LLMClient(provider=provider).complete(
+            "Reply with the single word: ok", agent="doctor", step="smoke", max_tokens=16
         )
     except Exception as exc:  # noqa: BLE001 - report, don't crash the check
         print(f"FAILED: {type(exc).__name__}: {exc}")
         return 1
-
-    print(f"reply           : {reply.strip()!r}")
-    print(observability.tracker.summary())
+    print(f"reply    : {reply.strip()!r}")
     return 0
 
 
 def cmd_search(args: argparse.Namespace) -> int:
-    """Run one search and print what a subagent would receive."""
+    """Run one search and print what a child agent would receive."""
     try:
-        results = WebSearch().search(args.query, num_results=args.n)
-    except Exception as exc:  # noqa: BLE001 - report, don't crash the check
+        results = WebSearch().search(args.query, num_results=args.n, tool=args.tool)
+    except Exception as exc:  # noqa: BLE001
         print(f"FAILED: {type(exc).__name__}: {exc}")
         return 1
-
     if not results:
         print("no results")
-        return 0
     for i, r in enumerate(results, 1):
-        print(f"\n[{i}] {r.title}")
-        print(f"    {r.url}")
-        print(f"    {r.snippet[:300]}")
+        print(f"\n[{i}] {r.title}\n    {r.url}\n    {r.snippet[:300]}")
     return 0
 
 
 def cmd_db(args: argparse.Namespace) -> int:
-    """Ask the database subagent's MCP bridge one question."""
+    """Ask the database through the nlquery-agent MCP server."""
 
     async def run() -> str:
         tool = DatabaseTool()
         async with tool.session():
             if args.question:
-                return (await tool.query(args.question, args.database)).answer
+                return await tool.query(args.question, args.database)
             return f"databases: {await tool.databases()}\n\n{await tool.schema(args.database)}"
 
     try:
@@ -90,21 +69,16 @@ def cmd_db(args: argparse.Namespace) -> int:
 
 
 def cmd_ask(args: argparse.Namespace) -> int:
-    """Run one research question end to end."""
+    """Research one question end to end."""
     observability.tracker.reset(budget_usd=settings.max_cost_usd_per_run)
+    runner = BaselineAgent() if args.baseline else ResearchGraph()
 
     async def run():
-        runner = (
-            ResearchGraph(verify=not args.no_verify)
-            if args.multiagent
-            else BaselineAgent(max_steps=args.max_steps)
-        )
         try:
             async with runner.database.session():
                 return await runner.run(args.question)
         except DatabaseUnavailable as exc:
-            # A dead database narrows the research, it doesn't end it.
-            print(f"note: database unavailable ({exc}); using web sources only\n")
+            print(f"note: database unavailable ({exc}); continuing without it\n")
             return await runner.run(args.question)
 
     try:
@@ -115,56 +89,42 @@ def cmd_ask(args: argparse.Namespace) -> int:
         return 1
 
     print(result.report())
-    if args.trace:
-        _print_trace(result)
+    if args.trace and not args.baseline:
+        print(f"\n--- {result.mode}" + (f": {result.motion}" if result.motion else ""))
+        for task in result.plan:
+            print(f"  {task.id:<6} {task.stance:<8} {task.objective[:70]}")
+        print(f"  {len(result.findings)} findings, {result.rounds} rounds")
     if not result.ok:
-        print("\n(the agent stopped before it was satisfied)")
+        print("\n(the run was incomplete - see failures or step budget)")
     print(observability.tracker.summary())
     observability.tracker.dump("ask")
     return 0
-
-
-def _print_trace(result) -> None:
-    if hasattr(result, "plan"):
-        print(f"\n--- plan ({result.complexity}) " + "-" * 24)
-        for task in result.plan:
-            print(f"  {task.id}  {task.tool:<9} {task.objective[:60]}")
-        print(f"\n  {len(result.findings)} findings from {len(result.plan)} subagents")
-        return
-    print("\n--- steps " + "-" * 33)
-    for i, step in enumerate(result.steps, 1):
-        print(f"  {i}. {step.action:<15} {step.detail[:50]:<52} {step.result}")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="deepresearch")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_doctor = sub.add_parser("doctor", help="check config and make one test call")
-    p_doctor.add_argument("--provider", help="override LLM_PROVIDER for this check")
-    p_doctor.set_defaults(func=cmd_doctor)
+    p = sub.add_parser("doctor", help="check config and make one test call")
+    p.add_argument("--provider", help="override LLM_PROVIDER for this check")
+    p.set_defaults(func=cmd_doctor)
 
-    p_search = sub.add_parser("search", help="run one search, no LLM involved")
-    p_search.add_argument("query")
-    p_search.add_argument("-n", type=int, default=3, help="number of results")
-    p_search.set_defaults(func=cmd_search)
+    p = sub.add_parser("search", help="run one search, no LLM involved")
+    p.add_argument("query")
+    p.add_argument("--tool", choices=list(CATEGORIES), default="web")
+    p.add_argument("-n", type=int, default=3, help="number of results")
+    p.set_defaults(func=cmd_search)
 
-    p_db = sub.add_parser("db", help="check the nlquery-agent MCP bridge")
-    p_db.add_argument("question", nargs="?", help="omit to print schema instead")
-    p_db.add_argument("--database", default="chinook")
-    p_db.set_defaults(func=cmd_db)
+    p = sub.add_parser("db", help="query the database through nlquery-agent")
+    p.add_argument("question", nargs="?", help="omit to print the schema")
+    p.add_argument("--database", default="chinook")
+    p.set_defaults(func=cmd_db)
 
-    p_ask = sub.add_parser("ask", help="research a question end to end")
-    p_ask.add_argument("question")
-    p_ask.add_argument("--max-steps", type=int, default=8)
-    p_ask.add_argument("--trace", action="store_true", help="show the tool calls")
-    p_ask.add_argument(
-        "--multiagent", action="store_true", help="lead agent + parallel subagents"
-    )
-    p_ask.add_argument(
-        "--no-verify", action="store_true", help="skip the critic and citation pass"
-    )
-    p_ask.set_defaults(func=cmd_ask)
+    p = sub.add_parser("ask", help="research a question end to end")
+    p.add_argument("question")
+    p.add_argument("--baseline", action="store_true", help="single agent instead")
+    p.add_argument("--trace", action="store_true", help="show the plan")
+    p.set_defaults(func=cmd_ask)
 
     args = parser.parse_args(argv)
     return args.func(args)

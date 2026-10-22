@@ -1,34 +1,32 @@
-"""Chainlit front end for the research graph.
-
-The graph reports progress through its `on_event` seam; this file is the only
-place that knows what Chainlit is, so `deepresearch` stays UI-agnostic.
-"""
+"""Chainlit front end. The only file that knows what Chainlit is."""
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
-# chainlit runs this file directly, so sys.path holds ui/ rather than the
-# project root and `deepresearch` would not be importable.
+# chainlit runs this file directly, so the project root is not on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import chainlit as cl  # noqa: E402
 
 from deepresearch import observability  # noqa: E402
 from deepresearch.config import settings  # noqa: E402
-from deepresearch.graph import ResearchGraph  # noqa: E402
+from deepresearch.graph import MultiAgentResult, ResearchGraph  # noqa: E402
 from deepresearch.observability import BudgetExceeded  # noqa: E402
 from deepresearch.tools.database import DatabaseUnavailable  # noqa: E402
 
-TOOL_LABEL = {"web": "web", "database": "database"}
+SIDE = {"pro": "For", "con": "Against"}
+
+
+def child_name(task) -> str:
+    if task.stance in SIDE:
+        return SIDE[task.stance] + (" · rebuttal" if task.id.endswith("-2") else "")
+    return f"Child {task.id}"
 
 
 class StepTree:
-    """Turns graph events into Chainlit steps.
-
-    Subagents run concurrently, so their steps are opened and closed by id
-    rather than nested by call stack.
-    """
+    """Turns graph events into Chainlit steps. Children run at the same time,
+    so their steps are tracked by task id."""
 
     def __init__(self) -> None:
         self.open: dict[str, cl.Step] = {}
@@ -39,131 +37,117 @@ class StepTree:
             await handler(data)
 
     async def _planned(self, data: dict) -> None:
-        tasks = data["tasks"]
-        async with cl.Step(name="lead · plan", type="llm") as step:
-            step.output = f"complexity: {data['complexity']} → {len(tasks)} subagents"
-            step.elements = [
-                cl.Text(
-                    name="tasks",
-                    content="\n".join(
-                        f"{t.id}  [{TOOL_LABEL.get(t.tool, t.tool)}]  {t.objective}"
-                        for t in tasks
-                    ),
-                    display="inline",
-                )
-            ]
+        plan = data["plan"]
+        async with cl.Step(name="Plan", type="llm", show_input=False) as step:
+            if plan.mode == "debate":
+                step.output = f"**Debate** · {plan.motion}"
+            else:
+                tasks = "\n".join(f"- {t.objective}" for t in plan.tasks)
+                step.output = f"**Facts** · {len(plan.tasks)} children\n\n{tasks}"
 
-    async def _subagent_start(self, data: dict) -> None:
+    async def _child_start(self, data: dict) -> None:
         task = data["task"]
-        step = cl.Step(name=f"{TOOL_LABEL.get(task.tool, task.tool)} · {task.id}", type="tool")
-        step.input = task.objective
+        step = cl.Step(name=child_name(task), type="tool", show_input=False)
+        step.output = task.objective if task.stance == "neutral" else ""
         await step.send()
         self.open[task.id] = step
 
-    async def _subagent_done(self, data: dict) -> None:
-        task, found = data["task"], data["findings"]
-        step = self.open.pop(task.id, None)
+    async def _child_done(self, data: dict) -> None:
+        step = self.open.pop(data["task"].id, None)
         if step:
-            step.output = f"{len(found)} findings"
+            found = len(data["findings"])
+            step.output = f"{step.output}\n\n**{found} findings**".strip()
             await step.update()
 
-    async def _subagent_failed(self, data: dict) -> None:
-        task = data["task"]
-        step = self.open.pop(task.id, None)
+    async def _child_failed(self, data: dict) -> None:
+        step = self.open.pop(data["task"].id, None)
         if step:
-            step.output = f"failed: {data['reason']}"
+            step.output = f"Failed: {data['reason']}"
             step.is_error = True
             await step.update()
 
     async def _reviewed(self, data: dict) -> None:
         gaps = data["gaps"]
-        async with cl.Step(name="lead · coverage review", type="llm") as step:
-            step.input = f"{data['findings']} findings against the question"
+        async with cl.Step(name="Coverage check", type="llm", show_input=False) as step:
             step.output = (
-                "every part covered"
-                if not gaps
-                else f"{len(gaps)} gap(s) → round {data['round'] + 1}\n"
-                + "\n".join(f"- {g.objective}" for g in gaps)
+                "Complete" if not gaps else "Missing:\n" + "\n".join(f"- {g.objective}" for g in gaps)
             )
 
     async def _verified(self, data: dict) -> None:
-        findings, clashes = data["findings"], data["contradictions"]
         counts: dict[str, int] = {}
-        for f in findings:
+        for f in data["findings"]:
             counts[f.verdict] = counts.get(f.verdict, 0) + 1
-        async with cl.Step(name="critic", type="llm") as step:
-            step.input = f"{len(findings)} claims"
-            lines = [f"{v}: {n}" for v, n in sorted(counts.items())]
-            if clashes:
-                lines.append("")
-                lines += [f"conflict: {c.note}" for c in clashes]
-            step.output = "\n".join(lines)
+        parts = [f"{n} {v}" for v, n in sorted(counts.items())]
+        if data["contradictions"]:
+            parts.append(f"{len(data['contradictions'])} conflicts")
+        async with cl.Step(name="Fact check", type="llm", show_input=False) as step:
+            step.output = " · ".join(parts)
 
-    async def _cited(self, data: dict) -> None:
-        async with cl.Step(name="citer", type="llm") as step:
-            step.output = f"{data['markers']} citation markers attached"
+
+def render(result: MultiAgentResult) -> str:
+    tracker = observability.tracker
+    lines = [result.answer]
+    if result.sources:
+        lines += ["", "---", "**Sources**", ""]
+        for s in result.sources:
+            link = s.url if s.url.startswith("http") else ""
+            lines.append(f"{s.n}. [{s.title}]({link})" if link else f"{s.n}. {s.title}")
+    minutes, seconds = divmod(int(tracker.elapsed_s), 60)
+    lines += [
+        "",
+        f"*{result.mode} · {len(result.findings)} findings · {result.rounds} rounds · "
+        f"${tracker.total_cost:.3f} · {minutes}m {seconds:02d}s*",
+    ]
+    if result.failures:
+        lines.append(f"*incomplete: {', '.join(result.failures)}*")
+    return "\n".join(lines)
+
+
+@cl.set_starters
+async def starters() -> list[cl.Starter]:
+    return [
+        cl.Starter(
+            label="Should banks use AI for loans?",
+            message="Should banks use AI models to approve or reject consumer loans?",
+        ),
+        cl.Starter(
+            label="Fintech defaults in Asia",
+            message=(
+                "Compare the rise in fintech lending defaults in Indonesia, the "
+                "Philippines and Thailand: default figures, what regulators blamed, "
+                "and what they did about it."
+            ),
+        ),
+        cl.Starter(
+            label="Chinook revenue vs real market",
+            message=(
+                "Find the top 3 countries by invoice revenue in the chinook database, "
+                "and what the recorded-music market looks like in each today."
+            ),
+        ),
+    ]
 
 
 @cl.on_chat_start
 async def start() -> None:
-    gaps = settings.missing()
-    if gaps:
-        await cl.Message(
-            content=f"⚠️ Missing config: {', '.join(gaps)} — add them to `.env`."
-        ).send()
-        return
-    await cl.Message(
-        content=(
-            "Ask a research question. Anything needing hard numbers is sent to "
-            "the SQL database; everything else is researched on the web.\n\n"
-            f"*{settings.provider} · lead `{settings.model_for('lead')}`*"
-        )
-    ).send()
+    missing = settings.missing()
+    if missing:
+        await cl.Message(content=f"Missing in `.env`: {', '.join(missing)}").send()
 
 
 @cl.on_message
 async def main(message: cl.Message) -> None:
     observability.tracker.reset(budget_usd=settings.max_cost_usd_per_run)
     graph = ResearchGraph(on_event=StepTree())
-
     try:
-        async with graph.database.session():
+        try:
+            async with graph.database.session():
+                result = await graph.run(message.content)
+        except DatabaseUnavailable:
             result = await graph.run(message.content)
-    except DatabaseUnavailable:
-        # A dead database narrows the research; it does not end it.
-        result = await graph.run(message.content)
     except BudgetExceeded as exc:
-        await cl.Message(content=f"⚠️ Stopped: {exc}").send()
+        await cl.Message(content=f"Stopped: {exc}").send()
         return
 
-    tracker = observability.tracker
-    elements = [
-        cl.Text(
-            name="run report",
-            content=(
-                f"rounds     {result.rounds}\n"
-                f"findings   {len(result.findings)}\n"
-                f"sources    {len(result.sources)}\n"
-                f"cost       ${tracker.total_cost:.4f}\n"
-                f"elapsed    {tracker.elapsed_s:.0f}s "
-                f"({tracker.call_seconds - tracker.elapsed_s:.0f}s saved in parallel)"
-            ),
-            display="inline",
-        ),
-        cl.Text(
-            name="sources",
-            content="\n".join(str(s) for s in result.sources) or "none",
-            display="inline",
-        ),
-    ]
-    if result.failures:
-        elements.append(
-            cl.Text(
-                name="failures",
-                content="\n".join(f"{k}: {v}" for k, v in result.failures.items()),
-                display="inline",
-            )
-        )
-
-    await cl.Message(content=result.answer, elements=elements).send()
+    await cl.Message(content=render(result)).send()
     observability.tracker.dump("ui")

@@ -1,17 +1,16 @@
-"""Score the agent on a fixed question set.
+"""Score an agent on the fixed question set.
 
-    python -m evals.run_eval                  # all questions
-    python -m evals.run_eval --only db-       # id prefix filter
-    python -m evals.run_eval --tag v0.1       # label the saved results
+    python -m evals.run_eval --agent multiagent --tag v1.0
+    python -m evals.run_eval --agent baseline --tag v1.0-baseline
+    python -m evals.run_eval --only debate-        # id prefix filter
 
-Results land in runs/evals/<tag>.json so two versions can be compared later.
+Results land in runs/evals/<tag>.json; compare two with evals.compare.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
-import os
 import time
 from pathlib import Path
 
@@ -27,6 +26,7 @@ from .judge import grade
 
 QUESTIONS = Path(__file__).resolve().parent / "questions.jsonl"
 RESULTS_DIR = Path("runs") / "evals"
+GROUPS = ("simple", "hard", "sources", "debate")
 
 
 def load_cases(only: str | None) -> list[dict]:
@@ -38,52 +38,68 @@ def load_cases(only: str | None) -> list[dict]:
     return [c for c in cases if not only or c["id"].startswith(only)]
 
 
-async def run_case(case: dict, agent: str, max_steps: int) -> dict:
+async def run_case(case: dict, agent: str) -> dict:
     """One question, one run. Cost and time are measured per case."""
     observability.tracker.reset(budget_usd=settings.max_cost_usd_per_run)
     start = time.perf_counter()
-    if agent == "baseline":
-        runner = BaselineAgent(max_steps=max_steps)
-    else:
-        runner = ResearchGraph(verify=agent == "verified")
+    runner = BaselineAgent() if agent == "baseline" else ResearchGraph()
     try:
-        async with runner.database.session():
+        try:
+            async with runner.database.session():
+                result = await runner.run(case["question"])
+        except DatabaseUnavailable:
             result = await runner.run(case["question"])
-    except DatabaseUnavailable:
-        result = await runner.run(case["question"])
     except BudgetExceeded as exc:
-        return {
-            "answer": f"[budget exceeded: {exc}]",
-            "cost": observability.tracker.total_cost,
-            "seconds": time.perf_counter() - start,
-        }
-
-    out = {
-        "answer": result.report(),
+        answer, extra = f"[budget exceeded: {exc}]", {}
+    except Exception as exc:  # noqa: BLE001 - one broken case must not end the sweep
+        answer, extra = f"[error: {type(exc).__name__}: {exc}]", {}
+    else:
+        answer, extra = result.report(), {}
+        if agent != "baseline":
+            # without these a failed case can only be diagnosed by reading prose
+            extra = {
+                "mode": result.mode,
+                "motion": result.motion,
+                "plan": [{"id": t.id, "stance": t.stance, "objective": t.objective} for t in result.plan],
+                "rounds": result.rounds,
+                "findings": len(result.findings),
+                "failures": result.failures,
+            }
+    return {
+        "answer": answer,
         "cost": observability.tracker.total_cost,
         "seconds": time.perf_counter() - start,
+        **extra,
     }
-    # Without the plan, a failed case can only be diagnosed by reading the prose.
-    if hasattr(result, "plan"):
-        out["plan"] = [
-            {"id": t.id, "tool": t.tool, "objective": t.objective} for t in result.plan
-        ]
-        out["rounds"] = result.rounds
-        out["findings"] = len(result.findings)
-        out["failures"] = result.failures
+
+
+def summarise(rows: list[dict]) -> dict:
+    def stats(rs: list[dict]) -> dict:
+        return {
+            "n": len(rs),
+            "passed": sum(r["score"] >= 2 for r in rs),
+            "mean": round(sum(r["score"] for r in rs) / len(rs), 2),
+            "cost_per_q": round(sum(r["cost_usd"] for r in rs) / len(rs), 4),
+            "secs_per_q": round(sum(r["seconds"] for r in rs) / len(rs)),
+        }
+
+    out = {"all": stats(rows)}
+    for g in GROUPS:
+        rs = [r for r in rows if r["group"] == g]
+        if rs:
+            out[g] = stats(rs)
+    judged = [r for r in rows if r.get("expected_mode") and "mode" in r]
+    if judged:
+        right = sum(r["mode"] == r["expected_mode"] for r in judged)
+        out["mode_choice"] = f"{right}/{len(judged)}"
     return out
 
 
 async def main() -> int:
     parser = argparse.ArgumentParser(prog="evals.run_eval")
-    parser.add_argument("--only", help="run only ids starting with this")
+    parser.add_argument("--agent", choices=("baseline", "multiagent"), default="multiagent")
     parser.add_argument("--tag", default="latest", help="name for the saved results")
-    parser.add_argument("--max-steps", type=int, default=8)
-    parser.add_argument(
-        "--agent",
-        choices=("baseline", "multiagent", "verified"),
-        default="baseline",
-    )
+    parser.add_argument("--only", help="run only ids starting with this")
     args = parser.parse_args()
 
     cases = load_cases(args.only)
@@ -91,73 +107,62 @@ async def main() -> int:
         print("no matching questions")
         return 1
 
-    judge_llm = LLMClient()
-    rows = []
-    # flush: piped or backgrounded, a 30-minute sweep would otherwise print
-    # nothing at all until it finished.
-    print(
-        f"{len(cases)} questions, agent={args.agent}, provider={settings.provider}\n",
-        flush=True,
-    )
+    judge = LLMClient()
+    out_path = RESULTS_DIR / f"{args.tag}.json"
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    rows: list[dict] = []
+    print(f"{len(cases)} questions, agent={args.agent}, provider={settings.provider}\n", flush=True)
 
     for case in cases:
-        run = await run_case(case, args.agent, args.max_steps)
-        answer, cost, secs = run["answer"], run["cost"], run["seconds"]
-        verdict = grade(judge_llm, case, answer)
+        run = await run_case(case, args.agent)
+        verdict = grade(judge, case, run["answer"])
         rows.append(
             {
                 "id": case["id"],
-                "check": case["check"],
+                "group": case["group"],
+                "expected_mode": case.get("mode"),
                 "score": verdict.score,
                 "reason": verdict.reason,
-                "cost_usd": round(cost, 5),
-                "seconds": round(secs, 1),
-                **{k: v for k, v in run.items() if k not in ("answer", "cost", "seconds")},
-                "answer": answer,
+                "cost_usd": round(run.pop("cost"), 5),
+                "seconds": round(run.pop("seconds"), 1),
+                **run,
             }
         )
-        mark = "ok  " if verdict.passed else "FAIL"
-        # A run whose subagents died can still read as a graceful answer, so
-        # surface the breakage next to the score rather than only in the file.
         note = verdict.reason[:60]
         if run.get("failures"):
-            note = f"[{len(run['failures'])} subagents failed] {note}"
+            note = f"[{len(run['failures'])} failed] {note}"
+        mode = f"{run['mode']:<6}" if "mode" in run else ""
         print(
-            f"  {mark} {case['id']:<16} {verdict.score}/3  "
-            f"${cost:.4f}  {secs:>5.1f}s  {note}",
+            f"  {'ok  ' if verdict.passed else 'FAIL'} {case['id']:<22} {verdict.score}/3 "
+            f"{mode} ${rows[-1]['cost_usd']:.4f} {rows[-1]['seconds']:>6.1f}s  {note}",
             flush=True,
         )
+        # saved after every case, so a crash or a stall keeps what finished
+        out_path.write_text(
+            json.dumps(
+                {
+                    "tag": args.tag,
+                    "agent": args.agent,
+                    "provider": settings.provider,
+                    "models": {r: settings.model_for(r) for r in ("lead", "subagent")},
+                    "summary": summarise(rows),
+                    "cases": rows,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
 
-    total_cost = sum(r["cost_usd"] for r in rows)
-    passed = sum(1 for r in rows if r["score"] >= 2)
-    mean = sum(r["score"] for r in rows) / len(rows)
-
-    print(f"\n  passed   {passed}/{len(rows)}")
-    print(f"  mean     {mean:.2f}/3")
-    print(f"  cost     ${total_cost:.4f}  (${total_cost / len(rows):.4f} per question)")
-    print(f"  time     {sum(r['seconds'] for r in rows):.0f}s")
-
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    out = RESULTS_DIR / f"{args.tag}.json"
-    out.write_text(
-        json.dumps(
-            {
-                "tag": args.tag,
-                "agent": args.agent,
-                "provider": settings.provider,
-                "models": {r: settings.model_for(r) for r in ("lead", "critic")},
-                "passed": passed,
-                "of": len(rows),
-                "mean_score": round(mean, 2),
-                "total_cost_usd": round(total_cost, 5),
-                "cases": rows,
-            },
-            indent=2,
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    print(f"  saved    {out}")
+    summary = summarise(rows)
+    print()
+    for name, s in summary.items():
+        if isinstance(s, dict):
+            print(f"  {name:<8} {s['passed']}/{s['n']} passed  mean {s['mean']:.2f}  "
+                  f"${s['cost_per_q']:.4f}/q  {s['secs_per_q']}s/q")
+    if "mode_choice" in summary:
+        print(f"  mode chosen correctly: {summary['mode_choice']}")
+    print(f"  saved {out_path}")
     return 0
 
 

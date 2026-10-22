@@ -2,7 +2,7 @@ import pytest
 
 from deepresearch.config import Settings
 from deepresearch.tools import database as db
-from deepresearch.tools.database import DatabaseTool, DatabaseUnavailable, QueryResult
+from deepresearch.tools.database import DatabaseTool, DatabaseUnavailable
 
 
 @pytest.fixture
@@ -13,32 +13,21 @@ def settings(monkeypatch) -> Settings:
 
 
 async def test_mock_mode_needs_no_server(settings):
-    result = await DatabaseTool(settings, mock=True).query("how many artists?")
-    assert isinstance(result, QueryResult)
-    assert "query_database" in result.answer
+    answer = await DatabaseTool(settings, mock=True).query("top 5 artists")
+    assert "query_database" in answer
+    assert "top 5 artists" in answer
 
 
-async def test_query_carries_the_question_through(settings):
-    result = await DatabaseTool(settings, mock=True).query("top 5 artists")
-    assert result.question == "top 5 artists"
-
-
-async def test_result_names_its_source_for_citation(settings):
-    result = await DatabaseTool(settings, mock=True).query("x")
-    assert "database" in result.cite()
-
-
-async def test_schema_and_tables_reach_their_tools(settings):
+async def test_schema_and_databases_reach_their_tools(settings):
     tool = DatabaseTool(settings, mock=True)
     assert "get_schema" in await tool.schema("northwind")
-    assert "list_tables" in await tool.tables()
     assert "list_available_databases" in await tool.databases()
 
 
 async def test_mock_session_is_a_no_op(settings):
     tool = DatabaseTool(settings, mock=True)
     async with tool.session():
-        assert "query_database" in (await tool.query("x")).answer
+        assert "query_database" in await tool.query("x")
 
 
 def test_missing_args_is_a_clear_error(monkeypatch):
@@ -98,3 +87,68 @@ def test_non_text_blocks_are_skipped():
     ]
     result = type("R", (), {"content": blocks, "isError": False})()
     assert db._text_of(result) == "kept"
+
+
+def test_nlquery_models_are_passed_to_the_server(monkeypatch):
+    monkeypatch.setenv("NLQUERY_MCP_ARGS", "../NLQuery-agent/mcp_server.py")
+    monkeypatch.setenv("NLQUERY_FAST_MODEL", "fast-x")
+    monkeypatch.setenv("NLQUERY_SMART_MODEL", "smart-y")
+    params = db._server_params(Settings.from_env())
+    assert params.env == {"LLM_FAST_MODEL": "fast-x", "LLM_SMART_MODEL": "smart-y"}
+
+
+def test_unset_models_leave_the_server_env_alone(monkeypatch):
+    monkeypatch.setenv("NLQUERY_MCP_ARGS", "../NLQuery-agent/mcp_server.py")
+    monkeypatch.setenv("NLQUERY_FAST_MODEL", "")
+    monkeypatch.setenv("NLQUERY_SMART_MODEL", "")
+    assert db._server_params(Settings.from_env()).env is None
+
+
+class _FakeSession:
+    """Stands in for the MCP client: wraps errors the way its task groups do."""
+
+    def __init__(self, *args):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, kind, exc, tb):
+        if exc is not None:
+            raise ExceptionGroup("unhandled errors in a TaskGroup", [exc])
+
+    async def initialize(self):
+        pass
+
+
+def _fake_mcp(monkeypatch, start_error=None):
+    import contextlib
+
+    import mcp
+    import mcp.client.stdio
+
+    @contextlib.asynccontextmanager
+    async def stdio_client(params):
+        if start_error:
+            raise start_error
+        async with _FakeSession():
+            yield "read", "write"
+
+    monkeypatch.setattr(mcp.client.stdio, "stdio_client", stdio_client)
+    monkeypatch.setattr(mcp, "ClientSession", _FakeSession)
+    monkeypatch.setattr(db, "_server_params", lambda settings: None)
+
+
+async def test_an_error_inside_the_session_comes_back_as_itself(settings, monkeypatch):
+    """A budget stop mid-run must not look like a dead database and trigger a rerun."""
+    _fake_mcp(monkeypatch)
+    with pytest.raises(KeyError):
+        async with DatabaseTool(settings).session():
+            raise KeyError("over budget")
+
+
+async def test_a_server_that_will_not_start_is_unavailable(settings, monkeypatch):
+    _fake_mcp(monkeypatch, start_error=OSError("no python"))
+    with pytest.raises(DatabaseUnavailable, match="no python"):
+        async with DatabaseTool(settings).session():
+            pass

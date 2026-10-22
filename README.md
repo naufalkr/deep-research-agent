@@ -1,127 +1,118 @@
 # deep-research-agent
 
-Ask one open-ended research question and get a cited report back. A lead agent
-plans the research, spawns **subagents that run in parallel**, a critic verifies
-every claim, and a separate pass attaches the citations.
+Ask a research question, get a cited report. A lead agent splits the work
+across child agents that research in parallel, then writes the answer.
 
-Most deep research agents only read the web. This one also **queries a real
-database** — when a claim needs a hard number, a subagent runs SQL against it
-instead of trusting an article.
+## How it works
 
-**Loop:** `plan → delegate (parallel) → research (web + SQL) → verify → synthesize → cite`
+**Lead** reads the question, picks a mode, hands out the work, and writes the
+report. It never searches anything itself.
 
----
+**Children** do the research. One kind of agent, many running at once, each
+with its own context. The lead gives each one a side: neutral, for, or against.
+Every child picks its own tools:
 
-## Status
+| Tool | Source |
+|---|---|
+| `web` | general web |
+| `news` | news articles |
+| `papers` | research papers |
+| `database` | SQL database, via [NLQuery-agent](https://github.com/naufalkr/NLQuery-agent) over MCP |
 
-Work in progress. Built in phases, tagged as each one lands:
+**Two modes**, chosen by the lead:
 
-| Tag | Phase | State |
-|---|---|---|
-| `v0.1-baseline` | Single agent, 2 tools — the control group | ✅ |
-| `v0.2-multiagent` | Lead agent + parallel subagents, coverage rounds | ✅ |
-| `v0.3-verified` | Critic + separate citation pass | ☐ |
-| `v0.4-evaluated` | Full eval harness | ☐ |
-| `v0.5-ui` | Web UI with streaming + trace view | ☐ |
-| `v1.0` | Memory, export, Docker | ☐ |
+```
+Facts   "compare fintech defaults in 3 countries"
+        lead -> 1-5 neutral children in parallel, one per part
+             -> coverage check: anything unanswered? send more children
+             -> report
 
-### Measured
-
-15 questions in `evals/questions.jsonl`, run against DeepSeek V4. The four
-database questions are checked by exact match; the rest by an LLM judge scoring
-0–3. The five `hard-` questions each need three or more separate lines of
-enquiry — that is where a single sequential agent runs out of attention.
-
-| | Baseline | Multi-agent | |
-|---|---|---|---|
-| **Simple (10)** — mean | 2.70/3 | **2.90/3** | 9/10 → 10/10 passed |
-| **Hard (5)** — mean | 2.60/3 | **3.00/3** | both 5/5 passed |
-| **Overall** — mean | 2.67/3 | **2.93/3** | |
-| Cost / question | $0.0084 | $0.0166 | ~2x |
-| Seconds / question | 70s | 179s | ~2.5x |
-
-Both of the baseline's hard-question gaps were coverage, not accuracy: a
-three-country comparison with one country left thin, a timeline missing a
-stage. Parallel subagents alone did not fix that — an early multi-agent build
-scored **1.60**, *below* the baseline, because it planned once and never
-checked its own coverage. What closed the gap was the lead reviewing the
-findings against the question and spending another round on whatever nothing
-had answered.
-
-```bash
-python -m evals.run_eval --tag v0.1-baseline                      # control
-python -m evals.run_eval --agent multiagent --tag v0.2-multiagent
+Debate  "should banks use AI to approve loans?"
+        lead -> one child for, one child against, in parallel
+             -> rebuttal: each side reads the other's findings and answers them
+             -> verdict
 ```
 
----
+Before the report is written, every finding is checked against its own
+evidence, and a separate pass attaches the citations so they can't be made up.
 
-## Quickstart
+**Why not one agent?** One agent can loop and search again - it's the baseline
+below, with the same four tools. It reads everything in one context and tends
+to follow whichever thread it found first. Splitting the work keeps each part
+of a question covered, and gives a judgement question a real case on both
+sides. It costs more and takes longer, so simple lookups still get a single
+child.
+
+## Results
+
+Same questions, same tools, same models (DeepSeek V4), graded by an LLM judge
+from 0 to 3 (exact match for database figures). 17 questions; the last 5 of
+the 22-question set did not run because the API balance ran out.
+
+| | Questions | Single agent | Multi-agent |
+|---|---|---|---|
+| Simple lookups | 10 | 2.90 | 2.70 |
+| Multi-part | 5 | 3.00 | 2.80 |
+| Judgement (debate) | 2 | 2.50 | **3.00** |
+| **All** | 17 | **2.88** | 2.76 |
+| Passed (score 2+) | | 17/17 | 17/17 |
+| Cost / question | | $0.02 | $0.05 |
+| Time / question | | 2 min | 8 min |
+
+The lead picked the right mode on all 16 questions that have one.
+
+Honest reading: with the same tools, the single agent is as good on lookups and
+multi-part questions, and much cheaper and faster. The debate mode made the
+difference on one of the two judgement questions: asked about restricting
+paylater, the single agent argued one side and said it had no evidence for the
+other. Of the multi-agent's three lost points, one was a bug (a report cut off
+mid-sentence, since fixed) and two were answer quality. Seventeen questions,
+one run each, so a 0.1 difference is within noise.
+
+Details and earlier versions: [docs/eval-log.md](docs/eval-log.md)
+
+## Run it
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate        # macOS/Linux: source .venv/bin/activate
+.venv\Scripts\activate            # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env              # add DEEPSEEK_API_KEY and EXA_API_KEY
 
-cp .env.example .env          # add your API keys
-
-python -m deepresearch doctor                 # check config, one live call
-python -m deepresearch search "your query"    # search only, no LLM
-python -m deepresearch db "your question"     # database only, via nlquery-agent
-python -m deepresearch ask "your question"    # coming with v0.1-baseline
+python -m deepresearch ask "your question"            # multi-agent
+python -m deepresearch ask "your question" --baseline # single agent
+chainlit run ui/app.py                                # web UI
 ```
 
----
+Or with Docker:
 
-## Notes
+```bash
+docker compose up        # http://localhost:8100
+```
 
-- **Orchestrator-worker** — a lead agent plans and delegates; subagents each get
-  their own context window, so deep exploration never pollutes the main thread.
-- **Web + database** — `web_search` for context and recent events,
-  `query_database` (via [nlquery-agent](https://github.com/naufalkr/NLQuery-agent)
-  over MCP) for numbers that have to be right.
-- **Citations are a separate pass** — synthesis writes the narrative, a second
-  agent attaches sources. Asking one agent to do both gets you invented
-  citations.
-- **Model tiering per role** — a frontier model plans and verifies; cheaper
-  open-weight models do extraction and summarization. Configured per agent in
-  `.env`.
-- **Effort scales to the question** — a simple lookup gets one subagent, a
-  complex analysis gets five. Multi-agent costs ~15x the tokens of a chat turn,
-  so this is the main cost control.
-- **Evaluated, not vibed** — a fixed question set plus an LLM judge scores every
-  change to accuracy, cost, and latency.
+The database tool needs [NLQuery-agent](https://github.com/naufalkr/NLQuery-agent)
+cloned next to this repo (`../NLQuery-agent`). Without it, everything else
+still works.
 
-Design rationale, architecture, and best practices: [docs/project-overview.md](docs/project-overview.md)
+Eval:
 
-## Project structure
+```bash
+python -m evals.run_eval --agent baseline --tag baseline
+python -m evals.run_eval --agent multiagent --tag multiagent
+python -m evals.compare baseline multiagent
+```
+
+## Layout
 
 ```text
-.
-├── deepresearch/              # core engine
-│   ├── __main__.py            #   python -m deepresearch
-│   ├── cli.py                 #   ask / eval
-│   ├── config.py              #   per-role model settings from .env
-│   ├── llm.py                 #   provider-agnostic client
-│   ├── observability.py       #   token / latency / cost tracking
-│   ├── state.py               #   shared research state
-│   ├── graph.py               #   LangGraph wiring
-│   ├── agents/
-│   │   ├── lead.py            #     plan → delegate → synthesize  ★
-│   │   ├── researcher.py      #     web subagent
-│   │   ├── analyst.py         #     database subagent
-│   │   ├── critic.py          #     claim verification
-│   │   └── citer.py           #     citation pass
-│   ├── tools/
-│   │   ├── web.py             #     search + fetch
-│   │   └── database.py        #     bridge to nlquery-agent
-│   └── prompts/               #   agent prompts as files
-│
-├── api/main.py                # FastAPI + SSE streaming
-├── run_api.py                 # web API entry point
-├── mcp_server.py              # MCP server
-│
-├── web/                       # frontend (Vite + React + Tailwind)
-├── evals/                     # question set + LLM judge + metrics
-├── tests/                     # pytest suite
-└── docs/project-overview.md   # design rationale
+deepresearch/
+  graph.py          the run: plan -> children -> second round -> check -> write
+  agents/lead.py    plans, checks coverage, writes
+  agents/child.py   the research agent and its tools
+  agents/verify.py  claim check and citation pass
+  agents/baseline.py  single-agent control
+  tools/            web search (Exa) and the database bridge (MCP)
+  prompts/          one prompt per step
+ui/app.py           Chainlit UI
+evals/              question set, LLM judge, compare
 ```

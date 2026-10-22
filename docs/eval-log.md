@@ -1,41 +1,71 @@
 # Eval log
 
 What each measured run showed, and what it changed. Kept because several runs
-looked like progress and were not.
-
-Results live in `runs/evals/<tag>.json`.
+looked like progress and were not. Results live in `runs/evals/<tag>.json`.
 
 ---
 
-## v0.1-baseline — single agent, 2 tools
+## v1.0 - debate mode, tools per child
 
-| Set | Passed | Mean | $/q | s/q |
-|---|---|---|---|---|
-| Simple (10) | 9/10 | 2.70 | $0.0028 | 43 |
-| Hard (5) | 5/5 | 2.60 | $0.0196 | 122 |
+The lead now picks a mode. **Facts**: neutral children, one per part, plus
+coverage rounds. **Debate**: a child for and a child against, then a rebuttal
+round. Every child picks its own tools (web, news, papers, database). The
+single-agent baseline got the same four tools, so the comparison is about the
+architecture, not the tools.
 
-The one simple-question failure (`contradiction`) asserted the opposite of what
-its sources said — nothing in a single-agent loop cross-checks a claim.
+17 questions (the last 5 of the 22 did not run - the API balance ran out):
 
-Both hard-question gaps were **coverage, not accuracy**: `hard-lending-compare`
-covered Indonesia in depth and left Thailand without a figure;
-`hard-mcp-timeline` missed a stage. A sequential agent spends its attention on
-whichever thread it followed first.
+| | n | Single agent | Multi-agent |
+|---|---|---|---|
+| Simple lookups | 10 | 2.90 (10/10) | 2.70 (10/10) |
+| Multi-part | 5 | 3.00 (5/5) | 2.80 (5/5) |
+| Judgement (debate) | 2 | 2.50 (2/2) | 3.00 (2/2) |
+| **All** | 17 | **2.88** | 2.76 |
+| Cost / question | | $0.02 | $0.05 |
+| Time / question | | 122s | 482s |
+
+Mode chosen correctly: 16/16.
+
+**What it says.** The earlier multi-part gap (v0.1 left a country thin) did not
+show up this time: with news and papers tools the single agent covered every
+part. The debate mode helped where it was meant to - on paylater, the single
+agent argued one side and said it had no evidence for the other; the debate
+gave both sides and a verdict. Multi-agent costs ~2.4x and takes ~4x longer.
+
+Where multi-agent lost points:
+
+| Case | Score | Why |
+|---|---|---|
+| `web-mcp` | 2 | **Bug.** The report was cut off mid-sentence: the reasoning model used most of its token budget thinking. Only empty replies were retried. Now any cut-off reply is retried with a bigger budget. |
+| `hard-model-landscape` | 2 | Claude was left unsupported; the coverage check did not flag it as a gap. |
+| `unanswerable` | 2 | Said revenue was "$0.00" instead of "no data for that period". |
+
+Caveats: 17 questions, one run each, judged by the same model family that
+answered. Differences of 0.1-0.2 are within noise.
+
+### Found while running it
+
+| Looked like | Actually |
+|---|---|
+| `db-revenue` failed, 1/3 | The answer was right. It wrote "United States"; the exact-match check only accepted "USA". Checks now accept alternatives. |
+| Baseline `sources-lending` 0/3, "fabricated" | The judge assumed today was its training cutoff and called real 2026 news invented. It is now told the date. This question is not among the 17 compared above. |
+| A budget stop restarted the run | Errors inside the database session came back wrapped by the MCP task groups and were taken for "database down", so the run started again without it. Fixed. |
+| Cost estimate too low | Tokens from truncated-and-retried calls were never counted. Fixed, but it is why this sweep ran out of balance. |
+| Mock results in the real search cache | Tests wrote fake results into `runs/cache`. 23 files removed; tests now use a temp dir. |
 
 ---
 
-## v0.2-multiagent — lead + parallel subagents
+## v0.2-multiagent - lead + parallel subagents
 
 | Set | Passed | Mean | $/q | s/q |
 |---|---|---|---|---|
 | Simple (10) | 10/10 | 2.90 | $0.0101 | 117 |
 | Hard (5) | 5/5 | 3.00 | $0.0295 | 304 |
 
-Overall mean 2.67 → 2.93, at ~2x cost and ~2.5x wall time. No regression on
-simple questions, which was the risk worth checking — spending five subagents
-on a lookup could easily have scored worse.
+Against v0.1 (2 tools, no news or papers): overall 2.67 -> 2.93, at ~2x cost
+and ~2.5x wall time.
 
-### The first multi-agent build scored 1.60 — below the baseline
+### The first multi-agent build scored 1.60 - below the baseline
 
 Parallel subagents alone made things worse. The lead planned once and never
 checked whether the plan covered the question, so a part it overlooked stayed
@@ -44,10 +74,21 @@ missing however many subagents ran. The failing answers said so themselves:
 > *"they lack any specific data on Indonesia's default figures... A direct
 > three-way comparison is therefore not possible."*
 
-The baseline could adapt mid-run — search, see what came back, search again.
-The multi-agent build could not. Adding a **coverage review** between gathering
-and writing (lead compares findings to the question, spends another round on
-whatever nothing answered) is what took it from 1.60 to 3.00.
+Adding a **coverage review** between gathering and writing (the lead compares
+findings to the question and spends another round on whatever nothing
+answered) took it from 1.60 to 3.00.
+
+---
+
+## v0.1-baseline - single agent, 2 tools
+
+| Set | Passed | Mean | $/q | s/q |
+|---|---|---|---|---|
+| Simple (10) | 9/10 | 2.70 | $0.0028 | 43 |
+| Hard (5) | 5/5 | 2.60 | $0.0196 | 122 |
+
+Both hard-question gaps were coverage, not accuracy: `hard-lending-compare`
+left Thailand without a figure, `hard-mcp-timeline` missed a stage.
 
 ---
 
@@ -55,48 +96,22 @@ whatever nothing answered) is what took it from 1.60 to 3.00.
 
 | Reported | Actually |
 |---|---|
-| mean 2.40, "5/5 passed" | Three answers had **zero findings**. Subagents timed out at 120s; the judge rubric gave 2/3 for admitting it honestly. |
-| One case 0/3 | `synthesize` returned the review step's JSON instead of prose — all three lead steps shared one prompt file with three output formats. |
+| mean 2.40, "5/5 passed" | Three answers had **zero findings**. Subagents timed out; the judge gave 2/3 for admitting it honestly. |
+| One case 0/3 | The report step returned the review step's JSON - three lead steps shared one prompt file. |
 | Header showed no agent | A `str.replace()` patch silently matched nothing. |
 
-Two of these read as success. Believing the first would have meant reporting
-"coverage review works, 1.60 → 2.40" while three of five answers were empty.
-
-Each was caught by instrumentation rather than by reading code:
-
-- `result.failures` — named the timeouts immediately
-- `TruncatedResponse` — turns a silently empty reply into a stated cause
-- storing the plan in eval results — showed the planner had made one subagent
-  for a question needing four
-
-The judge rubric was also wrong, not just the code: "honest uncertainty scores
-2, not 0" was written for an answer that is mostly right and admits one hole.
-It now reads *"an answer that gathered nothing and says so is a 0 however
-gracefully it says it."*
-
----
+Each was caught by instrumentation rather than by reading code: failures
+recorded per child, `TruncatedResponse` naming an empty reply, and the plan
+stored with every eval result. The judge rubric now reads *"an answer that
+gathered nothing and says so is a 0 however gracefully it says it."*
 
 ## Running a sweep
 
-Sweeps take 45-70 minutes with verification on, so they are usually
-backgrounded. Two things make the output readable while it runs:
-
 ```bash
-python -m evals.run_eval --agent verified --tag v0.3 2>&1 \
+python -m evals.run_eval --agent multiagent --tag v1.0 2>&1 \
   | grep --line-buffered -vE "INFO|HTTP Request|server\.py|_client\.py"
 ```
 
-- **Keep stderr.** Redirecting it to `/dev/null` to hide the MCP INFO lines also
-  discards tracebacks: one sweep died on an unhandled `TruncatedResponse` and
-  the output file held no clue why.
-- **`--line-buffered`.** Without it grep holds every line in its own buffer and
-  the file stays empty until the sweep ends, which looks identical to a hang.
-
-## Known issues
-
-- ~~**`plan_queries` truncates on `deepseek-v4-flash`.**~~ Fixed: `PLAN_TOKENS`
-  raised to 6000.
-- **A 15-question sweep run across a machine sleep is not comparable.** One case
-  took 2397s against 304s in a clean run, and the stalls produced timeouts that
-  are artefacts, not behaviour. The hard-question figures above come from the
-  clean run; discard sweeps whose per-question times jump like that.
+Keep stderr (it carries the tracebacks), and keep `--line-buffered` or the log
+stays empty until the sweep ends. Results are saved after every question. A
+sweep that ran across a machine sleep is not comparable - discard it.

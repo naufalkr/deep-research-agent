@@ -9,6 +9,9 @@ from ..config import Settings, settings as default_settings
 
 CACHE_DIR = os.path.join("runs", "cache", "search")
 
+# The three search tools are one engine with a different filter each.
+CATEGORIES = {"web": None, "news": "news", "papers": "research paper"}
+
 
 @dataclass(frozen=True)
 class SearchResult:
@@ -17,9 +20,6 @@ class SearchResult:
     snippet: str
     published: str | None = None
 
-    def cite(self) -> str:
-        return f"{self.title} ({self.url})"
-
 
 def _cache_path(kind: str, key: str) -> str:
     digest = hashlib.sha256(f"{kind}:{key}".encode()).hexdigest()[:16]
@@ -27,11 +27,10 @@ def _cache_path(kind: str, key: str) -> str:
 
 
 class WebSearch:
-    """Search wrapper that dedupes URLs across subagents and caches to disk.
+    """Exa search with per-instance URL dedup and a disk cache.
 
-    Dedup state lives here rather than in each subagent so that parallel
-    subagents don't spend tokens re-reading the same page. The cache means
-    repeated eval runs over the same questions don't re-spend API quota.
+    The cache means repeated eval runs over the same questions don't re-spend
+    API quota.
     """
 
     def __init__(
@@ -58,54 +57,50 @@ class WebSearch:
             return Exa(self.settings.exa_api_key)
         raise ValueError(f"Unsupported SEARCH_PROVIDER: {provider!r}")
 
-    def search(self, query: str, *, num_results: int = 5) -> list[SearchResult]:
-        """Search and return relevant excerpts, not whole pages."""
-        return self._fetch("search", query, num_results)
+    def search(
+        self, query: str, *, num_results: int = 5, tool: str = "web"
+    ) -> list[SearchResult]:
+        if tool not in CATEGORIES:
+            raise ValueError(f"unknown search tool: {tool!r}")
+        raw = self._cached(tool, query, num_results)
+        return self._dedupe([SearchResult(**r) for r in raw])
 
-    def find_similar(self, url: str, *, num_results: int = 5) -> list[SearchResult]:
-        """Pages covering the same ground as `url` - the critic's cross-check."""
-        return self._fetch("similar", url, num_results)
-
-    def _fetch(self, kind: str, key: str, num_results: int) -> list[SearchResult]:
-        raw = self._cached(kind, key, num_results)
-        results = [SearchResult(**r) for r in raw]
-        return self._dedupe(results)
-
-    def _cached(self, kind: str, key: str, num_results: int) -> list[dict]:
-        path = _cache_path(kind, f"{key}|{num_results}")
+    def _cached(self, tool: str, query: str, num_results: int) -> list[dict]:
+        # "search" keeps plain web searches on the cache keys they always had
+        kind = "search" if tool == "web" else tool
+        path = _cache_path(kind, f"{query}|{num_results}")
         if self.use_cache and os.path.isfile(path):
             with open(path, encoding="utf-8") as fh:
                 return json.load(fh)
 
-        raw = [asdict(r) for r in self._call(kind, key, num_results)]
+        raw = [asdict(r) for r in self._call(tool, query, num_results)]
         if self.use_cache:
             os.makedirs(CACHE_DIR, exist_ok=True)
             with open(path, "w", encoding="utf-8") as fh:
-                # readable on purpose: these files get inspected by hand
                 json.dump(raw, fh, indent=2, ensure_ascii=False)
         return raw
 
-    def _call(self, kind: str, key: str, num_results: int) -> list[SearchResult]:
+    def _call(self, tool: str, query: str, num_results: int) -> list[SearchResult]:
         if self.settings.search_provider == "mock":
+            kind = "search" if tool == "web" else tool
             return [
                 SearchResult(
-                    title=f"[mock] {kind} result {i}",
+                    title=f"[mock] {tool} result {i}",
                     url=f"https://example.com/{kind}/{i}",
-                    snippet=f"[mock] snippet for {key!r}",
+                    snippet=f"[mock] snippet for {query!r}",
                 )
                 for i in range(num_results)
             ]
 
-        # highlights, not full text: a whole page can be 5k+ tokens and would
-        # crowd out the subagent's context for no gain.
-        if kind == "search":
-            resp = self._client.search_and_contents(
-                key, num_results=num_results, type="auto", highlights=True
-            )
-        else:
-            resp = self._client.find_similar_and_contents(
-                key, num_results=num_results, highlights=True
-            )
+        category = CATEGORIES[tool]
+        # highlights, not full pages: a page can be 5k+ tokens
+        resp = self._client.search(
+            query,
+            num_results=num_results,
+            type="auto",
+            contents={"highlights": True},
+            **({"category": category} if category else {}),
+        )
         return [_to_result(r) for r in resp.results]
 
     def _dedupe(self, results: list[SearchResult]) -> list[SearchResult]:

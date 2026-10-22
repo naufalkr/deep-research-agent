@@ -6,9 +6,11 @@ import pytest
 from deepresearch.agents.lead import Lead
 from deepresearch.config import Settings
 from deepresearch.graph import ResearchGraph
-from deepresearch.state import SourceIndex
+from deepresearch.state import Plan, SourceIndex
 from deepresearch.tools.database import DatabaseTool
 from deepresearch.tools.web import WebSearch
+
+URL = "https://example.com/search/0"
 
 
 @pytest.fixture
@@ -19,497 +21,338 @@ def settings(monkeypatch) -> Settings:
 
 
 class RoutingLLM:
-    """Answers by step name, so parallel calls do not depend on ordering."""
+    """Answers by step name, so parallel calls do not depend on ordering.
+    A list value is replayed one reply per call; a callable gets the prompt."""
 
     def __init__(self, by_step: dict, delay: float = 0.0):
-        self.by_step = by_step
+        self.by_step = {k: list(v) if isinstance(v, list) else v for k, v in by_step.items()}
         self.delay = delay
-        self.steps = []
+        self.steps: list[str] = []
+        self.prompts: dict[str, list[str]] = {}
+        self.systems: dict[str, str] = {}
 
     async def acomplete(self, prompt, **kwargs):
         step = kwargs.get("step", "")
         self.steps.append(step)
+        self.prompts.setdefault(step, []).append(prompt)
+        self.systems[step] = kwargs.get("system", "")
         if self.delay:
             await asyncio.sleep(self.delay)
-        return self.by_step.get(step, "{}")
+        reply = self.by_step.get(step, "{}")
+        if callable(reply):
+            return reply(prompt)
+        if isinstance(reply, list):
+            return reply.pop(0) if reply else "{}"
+        return reply
 
 
-def plan_reply(complexity, *tools):
+def facts_plan(complexity, n):
     return json.dumps(
-        {
-            "complexity": complexity,
-            "tasks": [
-                {"id": f"t{i}", "objective": f"objective {i}", "tool": t}
-                for i, t in enumerate(tools, 1)
-            ],
-        }
+        {"mode": "facts", "complexity": complexity,
+         "tasks": [{"objective": f"objective {i}"} for i in range(1, n + 1)]}
     )
+
+
+def debate_plan(motion="Banks should use AI to approve loans"):
+    return json.dumps({"mode": "debate", "motion": motion})
+
+
+def one_finding(url=URL, claim="c"):
+    return json.dumps({"findings": [{"claim": claim, "evidence": "e", "source_url": url}]})
+
+
+def steps(**overrides):
+    base = {
+        "plan": facts_plan("simple", 1),
+        "plan_calls": json.dumps({"calls": [{"tool": "web", "query": "q"}]}),
+        "extract": one_finding(),
+        "review": '{"gaps": []}',
+        "verify": json.dumps({"verdicts": [{"n": 1, "verdict": "supported"}]}),
+        "synthesize": "The report.",
+        "cite": json.dumps({"citations": [{"s": 1, "n": [1]}]}),
+    }
+    return {**base, **overrides}
 
 
 def graph(settings, llm, **kw):
-    return ResearchGraph(
-        settings,
-        llm=llm,
-        web=WebSearch(settings, seen_urls=set()),
-        database=DatabaseTool(settings, mock=True),
-        **kw,
-    )
+    """Built the production way: every child gets its own searcher."""
+    return ResearchGraph(settings, llm=llm, database=DatabaseTool(settings, mock=True), **kw)
 
 
-# --- planning ---
+# --- the lead's plan ---
 
 
-async def test_complexity_caps_the_number_of_subagents(settings):
-    llm = RoutingLLM({"plan": plan_reply("simple", "web", "web", "web")})
-    complexity, tasks = await Lead(settings, llm=llm).plan("q")
-    assert complexity == "simple"
-    assert len(tasks) == 1
-
-
-async def test_complex_questions_get_more_subagents(settings):
-    llm = RoutingLLM({"plan": plan_reply("complex", *["web"] * 8)})
-    _, tasks = await Lead(settings, llm=llm, max_subagents=6).plan("q")
-    assert len(tasks) == 6
+async def test_complexity_caps_the_number_of_children(settings):
+    plan = await Lead(settings, llm=RoutingLLM({"plan": facts_plan("simple", 3)})).plan("q")
+    assert plan.mode == "facts"
+    assert len(plan.tasks) == 1
 
 
 async def test_max_subagents_wins_over_complexity(settings):
-    """The configured ceiling is a spend cap; a plan cannot exceed it."""
-    llm = RoutingLLM({"plan": plan_reply("complex", *["web"] * 8)})
-    _, tasks = await Lead(settings, llm=llm, max_subagents=2).plan("q")
-    assert len(tasks) == 2
+    llm = RoutingLLM({"plan": facts_plan("complex", 8)})
+    plan = await Lead(settings, llm=llm, max_subagents=2).plan("q")
+    assert len(plan.tasks) == 2
+
+
+async def test_fact_tasks_are_neutral(settings):
+    plan = await Lead(settings, llm=RoutingLLM({"plan": facts_plan("moderate", 2)})).plan("q")
+    assert [t.stance for t in plan.tasks] == ["neutral", "neutral"]
+    assert [t.id for t in plan.tasks] == ["t1", "t2"]
+
+
+async def test_a_debate_gets_one_child_per_side(settings):
+    plan = await Lead(settings, llm=RoutingLLM({"plan": debate_plan("X is good")})).plan("q")
+    assert plan.mode == "debate"
+    assert plan.motion == "X is good"
+    assert [(t.id, t.stance, t.objective) for t in plan.tasks] == [
+        ("pro", "pro", "X is good"),
+        ("con", "con", "X is good"),
+    ]
+
+
+async def test_a_debate_without_a_motion_falls_back_to_facts(settings):
+    llm = RoutingLLM({"plan": json.dumps({"mode": "debate", "motion": ""})})
+    plan = await Lead(settings, llm=llm).plan("the question")
+    assert plan.mode == "facts"
+    assert plan.tasks[0].objective == "the question"
 
 
 async def test_an_unparseable_plan_still_yields_one_task(settings):
-    llm = RoutingLLM({"plan": "the model rambled"})
-    _, tasks = await Lead(settings, llm=llm).plan("the question")
-    assert len(tasks) == 1
-    assert tasks[0].objective == "the question"
-
-
-async def test_an_unknown_tool_falls_back_to_web(settings):
-    reply = json.dumps(
-        {
-            "complexity": "simple",
-            "tasks": [{"id": "t1", "objective": "o", "tool": "psychic"}],
-        }
-    )
-    _, tasks = await Lead(settings, llm=RoutingLLM({"plan": reply})).plan("q")
-    assert tasks[0].tool == "web"
+    plan = await Lead(settings, llm=RoutingLLM({"plan": "rambling"})).plan("the question")
+    assert plan.mode == "facts"
+    assert [t.objective for t in plan.tasks] == ["the question"]
 
 
 async def test_tasks_without_an_objective_are_dropped(settings):
-    reply = json.dumps(
-        {
-            "complexity": "moderate",
-            "tasks": [
-                {"id": "t1", "objective": "", "tool": "web"},
-                {"id": "t2", "objective": "real", "tool": "web"},
-            ],
-        }
-    )
-    _, tasks = await Lead(settings, llm=RoutingLLM({"plan": reply})).plan("q")
-    assert [t.objective for t in tasks] == ["real"]
-
-
-# --- synthesis ---
+    reply = json.dumps({"mode": "facts", "complexity": "moderate",
+                        "tasks": [{"objective": ""}, {"objective": "real"}]})
+    plan = await Lead(settings, llm=RoutingLLM({"plan": reply})).plan("q")
+    assert [t.objective for t in plan.tasks] == ["real"]
 
 
 async def test_no_findings_yields_an_honest_non_answer(settings):
-    answer = await Lead(settings, llm=RoutingLLM({})).synthesize("q", [], SourceIndex())
+    plan = Plan(mode="facts", tasks=[])
+    answer = await Lead(settings, llm=RoutingLLM({})).synthesize("q", plan, [], SourceIndex())
     assert "no usable findings" in answer
 
 
-# --- the graph ---
+# --- facts mode ---
 
 
-async def test_subagents_run_in_parallel_not_in_sequence(settings):
-    """Three subagents at 0.2s a call should finish well under the serial time."""
-    llm = RoutingLLM(
-        {
-            "plan": plan_reply("complex", "web", "web", "web"),
-            "plan_queries": json.dumps({"queries": ["q"]}),
-            "extract": json.dumps({"findings": []}),
-            "synthesize": "report",
-        },
-        delay=0.2,
-    )
-    loop = asyncio.get_event_loop()
-    start = loop.time()
+async def test_children_run_in_parallel_not_in_sequence(settings):
+    """Three children at 0.2s a call finish well under the serial time."""
+    llm = RoutingLLM(steps(plan=facts_plan("complex", 3), extract='{"findings": []}'), delay=0.2)
+    start = asyncio.get_event_loop().time()
     await graph(settings, llm).run("q")
-    assert loop.time() - start < 1.2
-
-
-async def test_both_kinds_of_subagent_are_dispatched(settings):
-    llm = RoutingLLM(
-        {
-            "plan": plan_reply("moderate", "web", "database"),
-            "plan_queries": json.dumps({"queries": ["q"]}),
-            "extract": json.dumps({"findings": []}),
-            "plan_query": json.dumps({"question": "q", "database": "chinook"}),
-            "record": json.dumps({"findings": []}),
-            "synthesize": "report",
-        }
-    )
-    await graph(settings, llm).run("q")
-    assert "extract" in llm.steps and "record" in llm.steps
-
-
-async def test_a_page_two_subagents_both_find_gets_one_citation_number(settings):
-    llm = RoutingLLM(
-        {
-            "plan": plan_reply("moderate", "web", "web"),
-            "plan_queries": json.dumps({"queries": ["same query"]}),
-            "extract": json.dumps({"findings": []}),
-            "synthesize": "report",
-        }
-    )
-    result = await graph(settings, llm).run("q")
-    urls = [s.url for s in result.sources]
-    assert len(urls) == len(set(urls))
-
-
-async def test_sibling_subagents_are_not_starved_by_each_others_searches(settings):
-    """Sharing one dedup set let whichever searched first take every result,
-    leaving the others with nothing to extract."""
-    llm = RoutingLLM(
-        {
-            "plan": plan_reply("complex", "web", "web", "web"),
-            "plan_queries": json.dumps({"queries": ["identical query"]}),
-            "extract": json.dumps({"findings": []}),
-            "synthesize": "report",
-        }
-    )
-    g = ResearchGraph(settings, llm=llm, database=DatabaseTool(settings, mock=True))
-    await g.run("q")
-    assert llm.steps.count("extract") == 3
-
-
-async def test_a_failing_subagent_is_named_in_the_result(settings):
-    class Exploding(WebSearch):
-        def search(self, query, **kw):
-            raise RuntimeError("network died")
-
-    llm = RoutingLLM(
-        {
-            "plan": plan_reply("simple", "web"),
-            "plan_queries": json.dumps({"queries": ["q"]}),
-            "synthesize": "report",
-        }
-    )
-    g = ResearchGraph(
-        settings,
-        llm=llm,
-        web=Exploding(settings, seen_urls=set()),
-        database=DatabaseTool(settings, mock=True),
-    )
-    result = await g.run("q")
-    assert "t1" in result.failures
-    assert "network died" in result.failures["t1"]
-    assert result.ok is False
-
-
-async def test_one_failing_subagent_does_not_sink_the_run(settings):
-    class Exploding(WebSearch):
-        def search(self, query, **kw):
-            raise RuntimeError("network died")
-
-    llm = RoutingLLM(
-        {
-            "plan": plan_reply("moderate", "web", "database"),
-            "plan_queries": json.dumps({"queries": ["q"]}),
-            "plan_query": json.dumps({"question": "q", "database": "chinook"}),
-            "record": json.dumps(
-                {"findings": [{"claim": "survived", "evidence": "e", "source_url": ""}]}
-            ),
-            "synthesize": "report",
-        }
-    )
-    g = ResearchGraph(
-        settings,
-        llm=llm,
-        web=Exploding(settings, seen_urls=set()),
-        database=DatabaseTool(settings, mock=True),
-    )
-    result = await g.run("q")
-    assert [f.claim for f in result.findings] == ["survived"]
-
-
-async def test_a_hung_subagent_is_cut_off_by_the_timeout(settings, monkeypatch):
-    monkeypatch.setenv("SUBAGENT_TIMEOUT_S", "0.1")
-    slow = RoutingLLM(
-        {
-            "plan": plan_reply("simple", "web"),
-            "plan_queries": json.dumps({"queries": ["q"]}),
-            "extract": json.dumps({"findings": []}),
-            "synthesize": "report",
-        },
-        delay=5.0,
-    )
-    g = graph(Settings.from_env(), slow)
-    result = await asyncio.wait_for(g.run("q"), timeout=8)
-    assert result.findings == []
-
-
-async def test_report_lists_sources_and_the_answer(settings):
-    llm = RoutingLLM(
-        {
-            "plan": plan_reply("simple", "web"),
-            "plan_queries": json.dumps({"queries": ["q"]}),
-            "extract": json.dumps(
-                {
-                    "findings": [
-                        {
-                            "claim": "c",
-                            "evidence": "e",
-                            "source_url": "https://example.com/search/0",
-                        }
-                    ]
-                }
-            ),
-            "synthesize": "the report [1]",
-        }
-    )
-    result = await graph(settings, llm).run("q")
-    assert "the report [1]" in result.report()
-    assert "Sources:" in result.report()
-    assert result.ok
-
-
-async def test_a_run_with_no_findings_is_flagged_not_ok(settings):
-    llm = RoutingLLM(
-        {
-            "plan": plan_reply("simple", "web"),
-            "plan_queries": json.dumps({"queries": ["q"]}),
-            "extract": json.dumps({"findings": []}),
-        }
-    )
-    assert (await graph(settings, llm).run("q")).ok is False
-
-
-# --- coverage review and second rounds ---
-
-
-def gaps_reply(*objectives):
-    return json.dumps(
-        {"gaps": [{"objective": o, "tool": "web", "boundaries": "b"} for o in objectives]}
-    )
-
-
-class SequencedLLM(RoutingLLM):
-    """Like RoutingLLM, but a step can return a different reply each time."""
-
-    def __init__(self, by_step: dict, sequences: dict):
-        super().__init__(by_step)
-        self.sequences = {k: list(v) for k, v in sequences.items()}
-
-    async def acomplete(self, prompt, **kwargs):
-        step = kwargs.get("step", "")
-        self.steps.append(step)
-        queue = self.sequences.get(step)
-        if queue:
-            return queue.pop(0)
-        return self.by_step.get(step, "{}")
-
-
-def base_steps(finding_url="https://example.com/search/0"):
-    return {
-        "plan": plan_reply("simple", "web"),
-        "plan_queries": json.dumps({"queries": ["q"]}),
-        "extract": json.dumps(
-            {"findings": [{"claim": "c", "evidence": "e", "source_url": finding_url}]}
-        ),
-        "synthesize": "report",
-    }
+    assert asyncio.get_event_loop().time() - start < 1.6
+    assert llm.steps.count("plan_calls") == 3
 
 
 async def test_a_gap_triggers_a_second_round(settings):
-    llm = SequencedLLM(base_steps(), {"review": [gaps_reply("the missing part"), '{"gaps": []}']})
+    gaps = json.dumps({"gaps": [{"objective": "the missing part", "boundaries": "b"}]})
+    llm = RoutingLLM(steps(review=[gaps, '{"gaps": []}']))
     result = await graph(settings, llm).run("q")
     assert result.rounds == 2
-    assert len(result.plan) == 2
-    assert result.plan[1].id.startswith("r2-")
+    assert [t.id for t in result.plan] == ["t1", "r2-1"]
+    assert result.plan[1].boundaries == "b"
 
 
-async def test_no_gaps_means_no_second_round(settings):
-    llm = SequencedLLM(base_steps(), {"review": ['{"gaps": []}']})
-    result = await graph(settings, llm).run("q")
+async def test_no_gaps_means_one_round(settings):
+    result = await graph(settings, RoutingLLM(steps())).run("q")
     assert result.rounds == 1
-    assert llm.steps.count("extract") == 1
 
 
 async def test_rounds_stop_at_the_configured_ceiling(settings, monkeypatch):
-    """A lead that always finds gaps must not loop forever."""
     monkeypatch.setenv("MAX_RESEARCH_ROUNDS", "2")
-    llm = SequencedLLM(base_steps(), {"review": [gaps_reply("more") for _ in range(9)]})
-    result = await graph(Settings.from_env(), llm).run("q")
+    gaps = json.dumps({"gaps": [{"objective": "more"}]})
+    result = await graph(Settings.from_env(), RoutingLLM(steps(review=gaps))).run("q")
     assert result.rounds == 2
 
 
 async def test_findings_from_both_rounds_are_kept(settings):
-    """Built the production way: each subagent gets its own searcher, so a
-    round-two subagent is not starved by what round one already read."""
-    llm = SequencedLLM(base_steps(), {"review": [gaps_reply("missing"), '{"gaps": []}']})
-    g = ResearchGraph(settings, llm=llm, database=DatabaseTool(settings, mock=True))
-    result = await g.run("q")
-    assert len(result.findings) == 2
+    """Each child gets its own searcher, so round two is not starved by round one."""
+    gaps = json.dumps({"gaps": [{"objective": "missing"}]})
+    llm = RoutingLLM(steps(review=[gaps, '{"gaps": []}'], verify="{}"))
+    assert len((await graph(settings, llm).run("q")).findings) == 2
 
 
-async def test_an_unparseable_review_ends_the_loop_rather_than_looping(settings):
-    llm = SequencedLLM(base_steps(), {"review": ["the model rambled"]})
-    assert (await graph(settings, llm).run("q")).rounds == 1
-
-
-async def test_no_findings_means_no_review_call(settings):
-    """With nothing gathered there is nothing to check coverage against."""
-    steps = base_steps()
-    steps["extract"] = json.dumps({"findings": []})
-    llm = SequencedLLM(steps, {})
+async def test_no_findings_means_no_review(settings):
+    llm = RoutingLLM(steps(extract='{"findings": []}'))
     result = await graph(settings, llm).run("q")
     assert "review" not in llm.steps
-    assert result.rounds == 1
+    assert result.ok is False
 
 
-async def test_gap_tasks_carry_boundaries_so_round_two_does_not_repeat_itself(settings):
-    llm = SequencedLLM(base_steps(), {"review": [gaps_reply("missing"), '{"gaps": []}']})
-    result = await graph(settings, llm).run("q")
-    assert result.plan[1].boundaries == "b"
-
-
-async def test_each_lead_step_gets_its_own_prompt(settings):
-    """One shared prompt let the report step answer with the review JSON."""
-    from deepresearch.agents import lead as lead_mod
-
-    seen = {}
-
-    class PromptSpy(RoutingLLM):
-        async def acomplete(self, prompt, **kwargs):
-            seen[kwargs.get("step")] = kwargs.get("system", "")
-            return await super().acomplete(prompt, **kwargs)
-
-    llm = PromptSpy(
-        {
-            **base_steps(),
-            "review": '{"gaps": []}',
-        }
-    )
+async def test_facts_mode_writes_a_report_not_a_verdict(settings):
+    llm = RoutingLLM(steps())
     await graph(settings, llm).run("q")
-
-    assert seen["plan"] is not seen["synthesize"]
-    assert "complexity" in seen["plan"]
-    assert "gaps" in seen["review"]
-    assert "Write prose" in seen["synthesize"]
-    assert "gaps" not in seen["synthesize"]
+    assert "case against" not in llm.systems["synthesize"].lower()
+    assert "rebuttal" not in llm.steps
 
 
-# --- phase 3: critic and citation pass ---
+# --- debate mode ---
 
 
-def verify_steps():
-    return {
-        **base_steps(),
-        "review": '{"gaps": []}',
-        "verify": json.dumps({"verdicts": [{"n": 1, "verdict": "supported"}]}),
-        "cite": json.dumps({"citations": [{"s": 1, "n": [1]}]}),
+def debate_steps(**overrides):
+    return steps(plan=debate_plan(), **overrides)
+
+
+def by_side(pro, con, rebuttal="{}"):
+    """Extract replies chosen by the brief, since both sides run at once."""
+
+    def reply(prompt):
+        if "Rebuttal round" in prompt:
+            return rebuttal
+        return pro if "FOR" in prompt else con
+
+    return reply
+
+
+async def test_a_debate_runs_both_sides_then_rebuttals(settings):
+    llm = RoutingLLM(debate_steps(verify="{}"))
+    result = await graph(settings, llm).run("should banks use AI?")
+    assert result.mode == "debate"
+    assert [t.id for t in result.plan] == ["pro", "con", "pro-2", "con-2"]
+    assert result.rounds == 2
+    assert {(f.stance, f.rebuttal) for f in result.findings} == {
+        ("pro", False), ("con", False), ("pro", True), ("con", True)
     }
 
 
-async def test_verification_runs_the_critic_then_the_citer(settings):
-    llm = SequencedLLM(verify_steps(), {})
+async def test_each_side_rebuts_the_other_sides_findings(settings):
+    extract = by_side(one_finding(claim="pro point"), one_finding(claim="con point"))
+    llm = RoutingLLM(debate_steps(extract=extract))
     await graph(settings, llm).run("q")
-    assert llm.steps.index("verify") < llm.steps.index("synthesize")
-    assert llm.steps.index("synthesize") < llm.steps.index("cite")
+    rebuttal_briefs = [b for b in llm.prompts["plan_calls"] if "Rebuttal round" in b]
+    assert any("con point" in b and "FOR" in b for b in rebuttal_briefs)
+    assert any("pro point" in b and "AGAINST" in b for b in rebuttal_briefs)
 
 
-async def test_verify_off_reproduces_the_v0_2_pipeline(settings):
-    """v0.2's numbers must stay reproducible, or the phase-3 delta is unreadable."""
-    llm = SequencedLLM(verify_steps(), {})
-    await graph(settings, llm, verify=False).run("q")
-    assert "verify" not in llm.steps
-    assert "cite" not in llm.steps
+async def test_debate_has_no_coverage_review(settings):
+    llm = RoutingLLM(debate_steps())
+    await graph(settings, llm).run("q")
+    assert "review" not in llm.steps
+
+
+async def test_a_side_with_nothing_to_answer_skips_its_rebuttal(settings):
+    extract = by_side(one_finding(claim="pro point"), '{"findings": []}')
+    llm = RoutingLLM(debate_steps(extract=extract))
+    result = await graph(settings, llm).run("q")
+    assert [t.id for t in result.plan] == ["pro", "con", "con-2"]
+
+
+async def test_no_findings_on_either_side_means_no_rebuttal_round(settings):
+    llm = RoutingLLM(debate_steps(extract='{"findings": []}'))
+    result = await graph(settings, llm).run("q")
+    assert result.rounds == 1
+    assert llm.steps.count("plan_calls") == 2
+
+
+async def test_the_verdict_sees_the_motion_and_both_sides(settings):
+    extract = by_side(one_finding(claim="pro point"), one_finding(claim="con point"))
+    llm = RoutingLLM(debate_steps(extract=extract, verify="{}"))
+    await graph(settings, llm).run("q")
+    prompt = llm.prompts["synthesize"][0]
+    assert "Position debated: Banks should use AI to approve loans" in prompt
+    assert "side: for" in prompt and "side: against" in prompt
+    assert "Verdict" in llm.systems["synthesize"]
+
+
+# --- checking and citing ---
+
+
+async def test_the_critic_runs_before_writing_and_the_citer_after(settings):
+    llm = RoutingLLM(steps())
+    await graph(settings, llm).run("q")
+    assert llm.steps.index("verify") < llm.steps.index("synthesize") < llm.steps.index("cite")
 
 
 async def test_the_critics_verdict_reaches_the_finding(settings):
-    llm = SequencedLLM(verify_steps(), {})
-    result = await graph(settings, llm).run("q")
+    result = await graph(settings, RoutingLLM(steps())).run("q")
     assert result.findings[0].verdict == "supported"
 
 
-async def test_contradictions_are_carried_into_the_result(settings):
-    steps = verify_steps()
-    steps["verify"] = json.dumps(
-        {
-            "verdicts": [{"n": 1, "verdict": "contradicted"}],
-            "contradictions": [{"n": [1, 1], "note": "figures disagree"}],
-        }
-    )
-    llm = SequencedLLM(steps, {})
-    result = await graph(settings, llm).run("q")
-    assert len(result.contradictions) == 1
-    assert "figures disagree" in result.contradictions[0].note
-
-
 async def test_contradictions_are_shown_to_the_writer(settings):
-    steps = verify_steps()
-    steps["verify"] = json.dumps(
-        {"contradictions": [{"n": [1, 1], "note": "figures disagree"}]}
-    )
-    seen = {}
-
-    class Spy(SequencedLLM):
-        async def acomplete(self, prompt, **kwargs):
-            seen[kwargs.get("step")] = prompt
-            return await super().acomplete(prompt, **kwargs)
-
-    await graph(settings, Spy(steps, {})).run("q")
-    assert "figures disagree" in seen["synthesize"]
+    verify = json.dumps({"contradictions": [{"n": [1, 1], "note": "figures disagree"}]})
+    llm = RoutingLLM(steps(verify=verify))
+    result = await graph(settings, llm).run("q")
+    assert "figures disagree" in result.contradictions[0].note
+    assert "figures disagree" in llm.prompts["synthesize"][0]
 
 
-async def test_the_writer_is_told_not_to_cite(settings):
-    """Citing is the citer's job; two agents doing it produces invented numbers."""
-    from deepresearch.agents.lead import REPORT_PROMPT
-
-    assert "Do not add citation markers" in REPORT_PROMPT
+async def test_the_report_lists_only_cited_sources(settings):
+    """Five results were read; one was cited."""
+    result = await graph(settings, RoutingLLM(steps())).run("q")
+    assert result.answer == "The report. [1]"
+    assert [s.url for s in result.sources] == [URL]
+    assert "Sources:" in result.report()
 
 
 async def test_a_broken_critic_still_yields_a_report(settings):
-    """Verification improves a report; losing it must not cost the report."""
-
-    class Boom(SequencedLLM):
+    class Boom(RoutingLLM):
         async def acomplete(self, prompt, **kwargs):
             if kwargs.get("step") == "verify":
                 raise RuntimeError("critic exploded")
             return await super().acomplete(prompt, **kwargs)
 
-    result = await graph(settings, Boom(verify_steps(), {})).run("q")
+    result = await graph(settings, Boom(steps())).run("q")
     assert result.answer
+    assert result.findings[0].verdict == "unchecked"
     assert "critic exploded" in result.failures["critic"]
 
 
-async def test_a_broken_citer_ships_the_uncited_report(settings):
-    class Boom(SequencedLLM):
+async def test_a_broken_citer_ships_the_uncited_report_with_all_sources(settings):
+    class Boom(RoutingLLM):
         async def acomplete(self, prompt, **kwargs):
             if kwargs.get("step") == "cite":
                 raise RuntimeError("citer exploded")
             return await super().acomplete(prompt, **kwargs)
 
-    result = await graph(settings, Boom(verify_steps(), {})).run("q")
-    assert result.answer == "report"
+    result = await graph(settings, Boom(steps())).run("q")
+    assert result.answer == "The report."
+    assert len(result.sources) == 5
     assert "citer exploded" in result.failures["citer"]
 
 
-async def test_a_broken_critic_does_not_lose_the_findings(settings):
-    class Boom(SequencedLLM):
-        async def acomplete(self, prompt, **kwargs):
-            if kwargs.get("step") == "verify":
-                raise RuntimeError("boom")
-            return await super().acomplete(prompt, **kwargs)
-
-    result = await graph(settings, Boom(verify_steps(), {})).run("q")
-    assert len(result.findings) == 1
-    assert result.findings[0].verdict == "unchecked"
+# --- failures ---
 
 
-# --- the progress seam a UI hooks into ---
+class Exploding(WebSearch):
+    def search(self, query, **kw):
+        raise RuntimeError("network died")
+
+
+async def test_a_failing_child_is_named_in_the_result(settings):
+    g = ResearchGraph(settings, llm=RoutingLLM(steps()), web=Exploding(settings),
+                      database=DatabaseTool(settings, mock=True))
+    result = await g.run("q")
+    assert "network died" in result.failures["t1"]
+    assert result.ok is False
+
+
+async def test_one_failing_child_does_not_sink_the_run(settings):
+    plan_calls = [
+        json.dumps({"calls": [{"tool": "web", "query": "w"}]}),
+        json.dumps({"calls": [{"tool": "database", "query": "d"}]}),
+    ]
+    llm = RoutingLLM(steps(plan=facts_plan("moderate", 2), plan_calls=plan_calls,
+                           extract=one_finding("db://chinook", "survived"), verify="{}"))
+    g = ResearchGraph(settings, llm=llm, web=Exploding(settings),
+                      database=DatabaseTool(settings, mock=True))
+    result = await g.run("q")
+    assert [f.claim for f in result.findings] == ["survived"]
+    assert "t1" in result.failures
+
+
+async def test_a_hung_child_is_cut_off_by_the_timeout(settings, monkeypatch):
+    monkeypatch.setenv("SUBAGENT_TIMEOUT_S", "0.1")
+    slow = RoutingLLM(steps(), delay=1.0)
+    result = await asyncio.wait_for(graph(Settings.from_env(), slow).run("q"), timeout=10)
+    assert result.findings == []
+    assert "timed out" in result.failures["t1"]
+
+
+# --- the progress events a UI listens to ---
 
 
 def recorder():
@@ -521,59 +364,35 @@ def recorder():
     return seen, on_event
 
 
-async def test_a_run_reports_every_stage(settings):
+async def test_a_facts_run_reports_every_stage(settings):
     seen, on_event = recorder()
-    llm = SequencedLLM(verify_steps(), {})
-    await graph(settings, llm, on_event=on_event).run("q")
+    await graph(settings, RoutingLLM(steps()), on_event=on_event).run("q")
     kinds = [k for k, _ in seen]
     assert kinds[0] == "start"
-    for stage in ("planned", "subagent_start", "subagent_done", "reviewed",
-                  "verified", "writing", "cited"):
+    for stage in ("planned", "child_start", "child_done", "reviewed", "verified", "writing"):
         assert stage in kinds, stage
+    assert dict(seen)["planned"]["plan"].mode == "facts"
 
 
-async def test_events_carry_what_the_ui_needs_to_draw(settings):
+async def test_a_debate_reports_its_rebuttal_round(settings):
     seen, on_event = recorder()
-    llm = SequencedLLM(verify_steps(), {})
-    await graph(settings, llm, on_event=on_event).run("q")
-    by_kind = dict(seen)
-    assert by_kind["planned"]["complexity"] == "simple"
-    assert by_kind["planned"]["tasks"][0].id == "t1"
-    assert by_kind["subagent_done"]["task"].id == "t1"
-    assert by_kind["cited"]["markers"] >= 1
+    await graph(settings, RoutingLLM(debate_steps()), on_event=on_event).run("q")
+    rebuttal = dict(seen)["rebuttal"]
+    assert [t.id for t in rebuttal["tasks"]] == ["pro-2", "con-2"]
 
 
-async def test_a_failing_subagent_is_reported_as_it_happens(settings):
-    class Exploding(WebSearch):
-        def search(self, query, **kw):
-            raise RuntimeError("network died")
-
+async def test_a_failing_child_is_reported_as_it_happens(settings):
     seen, on_event = recorder()
-    llm = SequencedLLM(verify_steps(), {})
-    g = ResearchGraph(
-        settings,
-        llm=llm,
-        web=Exploding(settings, seen_urls=set()),
-        database=DatabaseTool(settings, mock=True),
-        on_event=on_event,
-    )
+    g = ResearchGraph(settings, llm=RoutingLLM(steps()), web=Exploding(settings),
+                      database=DatabaseTool(settings, mock=True), on_event=on_event)
     await g.run("q")
-    failed = [d for k, d in seen if k == "subagent_failed"]
+    failed = [d for k, d in seen if k == "child_failed"]
     assert failed and "network died" in failed[0]["reason"]
 
 
 async def test_a_broken_listener_does_not_lose_the_research(settings):
-    """A UI hiccup must not cost the run."""
-
     async def on_event(kind, data):
         raise RuntimeError("the UI fell over")
 
-    llm = SequencedLLM(verify_steps(), {})
-    result = await graph(settings, llm, on_event=on_event).run("q")
-    assert result.answer
-
-
-async def test_no_listener_means_no_overhead(settings):
-    llm = SequencedLLM(verify_steps(), {})
-    result = await graph(settings, llm).run("q")
+    result = await graph(settings, RoutingLLM(steps()), on_event=on_event).run("q")
     assert result.answer

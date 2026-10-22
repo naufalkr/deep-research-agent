@@ -1,28 +1,18 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..config import Settings, settings as default_settings
-from ..llm import LLMClient
+from ..llm import LLMClient, parse_json
+from ..state import Source, SourceIndex, database_url
 from ..tools.database import DatabaseTool, DatabaseUnavailable
-from ..tools.web import SearchResult, WebSearch
+from ..tools.web import CATEGORIES, WebSearch
 
 PROMPT = (Path(__file__).resolve().parent.parent / "prompts" / "baseline.md").read_text(
     encoding="utf-8"
 )
-
-
-@dataclass(frozen=True)
-class Source:
-    n: int
-    title: str
-    url: str
-
-    def __str__(self) -> str:
-        return f"[{self.n}] {self.title} - {self.url}"
 
 
 @dataclass
@@ -47,23 +37,11 @@ class ResearchResult:
         return "\n".join(out)
 
 
-def _parse_action(text: str) -> dict:
-    """Pull the JSON action out of a reply, tolerating fences and stray prose."""
-    text = text.strip()
-    fenced = re.search(r"```(?:json)?\s*(.+?)\s*```", text, re.S)
-    if fenced:
-        text = fenced.group(1).strip()
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end == -1:
-        raise ValueError(f"no JSON object in reply: {text[:200]}")
-    return json.loads(text[start : end + 1])
-
-
 class BaselineAgent:
-    """One agent, one loop, two tools - the control group for v0.1.
+    """One agent, one loop, the same four tools the children have.
 
-    Deliberately has no planner, no subagents, no separate critic or citation
-    pass. Later phases are measured against what this scores.
+    The control group: no lead, no parallel children, no checking or citation
+    pass. The multi-agent system is measured against this.
     """
 
     def __init__(
@@ -83,92 +61,72 @@ class BaselineAgent:
 
     async def run(self, question: str) -> ResearchResult:
         result = ResearchResult(question=question, answer="")
+        index = SourceIndex()
         observations: list[str] = []
 
         for _ in range(self.max_steps):
             try:
-                action = _parse_action(await self._think(question, observations))
+                action = parse_json(await self._think(question, observations))
             except (ValueError, json.JSONDecodeError) as exc:
                 observations.append(f"Your last reply was not valid JSON ({exc}).")
                 continue
 
             kind = action.get("action")
             if kind == "answer":
-                result.answer = action.get("text", "").strip()
-                return result
+                result.answer = str(action.get("text", "")).strip()
+                break
             if kind == "search":
-                observations.append(self._do_search(action, result))
+                observations.append(self._search(action, result, index))
             elif kind == "query_database":
-                observations.append(await self._do_query(action, result))
+                observations.append(await self._query(action, result, index))
             else:
                 observations.append(f"Unknown action {kind!r}.")
+        else:
+            result.answer = await self._think(
+                question,
+                observations,
+                nudge="Step budget reached. Answer now with what you have, and say "
+                "which parts remain unsupported.",
+            )
+            result.ok = False  # ran out of steps rather than deciding it was done
 
-        result.answer = await self._force_answer(question, observations)
-        result.ok = False  # ran out of steps rather than deciding it was done
+        result.sources = index.sources
         return result
 
-    async def _think(self, question: str, observations: list[str]) -> str:
-        return await self.llm.acomplete(
-            self._context(question, observations),
-            role="lead",
-            system=PROMPT,
-            agent="baseline",
-            step="think",
-        )
-
-    async def _force_answer(self, question: str, observations: list[str]) -> str:
-        return await self.llm.acomplete(
-            self._context(question, observations)
-            + "\n\nStep budget reached. Answer now with what you have, and say "
-            "which parts remain unsupported.",
-            role="lead",
-            system=PROMPT,
-            agent="baseline",
-            step="force_answer",
-        )
-
-    def _context(self, question: str, observations: list[str]) -> str:
-        parts = [f"Question: {question}"]
+    async def _think(self, question: str, observations: list[str], nudge: str = "") -> str:
+        prompt = f"Question: {question}"
         if observations:
-            parts.append("\nWhat you have gathered so far:\n" + "\n\n".join(observations))
-        return "\n".join(parts)
+            prompt += "\n\nWhat you have gathered so far:\n" + "\n\n".join(observations)
+        if nudge:
+            prompt += f"\n\n{nudge}"
+        return await self.llm.acomplete(
+            prompt,
+            role="lead",
+            system=PROMPT,
+            agent="baseline",
+            step="force_answer" if nudge else "think",
+        )
 
-    def _do_search(self, action: dict, result: ResearchResult) -> str:
-        query = action.get("query", "")
-        results = self.web.search(query, num_results=5)
+    def _search(self, action: dict, result: ResearchResult, index: SourceIndex) -> str:
+        query = str(action.get("query", ""))
+        tool = action.get("tool", "web")
+        if tool not in CATEGORIES:
+            tool = "web"
+        results = self.web.search(query, num_results=5, tool=tool)
+        result.steps.append(Step(tool, query, f"{len(results)} results"))
         if not results:
-            result.steps.append(Step("search", query, "no new results"))
             return f"Search {query!r} returned nothing new - every hit was already read."
+        lines = [f"[{index.add(r.title, r.url).n}] {r.title}\n{r.snippet}" for r in results]
+        return f"{tool.capitalize()} search {query!r} returned:\n" + "\n\n".join(lines)
 
-        lines = []
-        for r in results:
-            source = self._add_source(result, r.title, r.url)
-            lines.append(f"[{source.n}] {r.title}\n{r.snippet}")
-        observation = f"Search {query!r} returned:\n" + "\n\n".join(lines)
-        result.steps.append(Step("search", query, f"{len(results)} results"))
-        return observation
-
-    async def _do_query(self, action: dict, result: ResearchResult) -> str:
-        question = action.get("question", "")
-        database = action.get("database", "chinook")
+    async def _query(self, action: dict, result: ResearchResult, index: SourceIndex) -> str:
+        question = str(action.get("question", ""))
+        database = str(action.get("database") or "chinook")
         try:
-            answer = (await self.database.query(question, database)).answer
+            answer = await self.database.query(question, database)
         except DatabaseUnavailable as exc:
-            result.steps.append(Step("query_database", question, f"unavailable: {exc}"))
-            return f"The database is unavailable ({exc}). Continue with web sources."
-
-        source = self._add_source(result, f"internal database ({database})", "")
-        result.steps.append(Step("query_database", question, "ok"))
-        return f"[{source.n}] Database answer to {question!r}:\n{answer}"
-
-    def _add_source(self, result: ResearchResult, title: str, url: str) -> Source:
-        for existing in result.sources:
-            if url and existing.url == url:
-                return existing
-        source = Source(len(result.sources) + 1, title, url)
-        result.sources.append(source)
-        return source
-
-
-async def ask(question: str, **kwargs) -> ResearchResult:
-    return await BaselineAgent(**kwargs).run(question)
+            result.steps.append(Step("database", question, f"unavailable: {exc}"))
+            return f"The database is unavailable ({exc}). Continue with the other tools."
+        n = index.add(f"internal database ({database})", database_url(database)).n
+        result.steps.append(Step("database", question, "ok"))
+        return f"[{n}] Database answer to {question!r}:\n{answer}"

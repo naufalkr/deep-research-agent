@@ -20,4 +20,8 @@ web/.vite/
 .DS_Store
 .idea/
 .vscode/
-.chainlit/
+.chainlit/translations/
+
+# personal notes and the local chainlit readme
+docs/new-concept.md
+chainlit.md

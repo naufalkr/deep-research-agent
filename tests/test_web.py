@@ -15,11 +15,6 @@ def mock_settings(monkeypatch) -> Settings:
     return Settings.from_env()
 
 
-@pytest.fixture(autouse=True)
-def cache_in_tmp(tmp_path, monkeypatch):
-    monkeypatch.setattr(web, "CACHE_DIR", str(tmp_path / "search"))
-
-
 def test_search_returns_results(mock_settings):
     results = WebSearch(mock_settings).search("anything", num_results=3)
     assert len(results) == 3
@@ -65,7 +60,7 @@ def test_cache_prevents_a_second_api_call(mock_settings, monkeypatch):
 
     calls = {"n": 0}
 
-    def counted(self, kind, key, num_results):
+    def counted(self, tool, query, num_results):
         calls["n"] += 1
         return []
 
@@ -88,11 +83,26 @@ def test_cache_can_be_turned_off(mock_settings):
     assert not os.path.isdir(web.CACHE_DIR)
 
 
-def test_find_similar_is_cached_separately_from_search(mock_settings):
-    searcher = WebSearch(mock_settings)
-    searcher.search("https://example.com/a", num_results=2)
-    searcher.find_similar("https://example.com/a", num_results=2)
-    assert len(os.listdir(web.CACHE_DIR)) == 2
+def test_each_tool_is_cached_separately(mock_settings):
+    for tool in ("web", "news", "papers"):
+        WebSearch(mock_settings).search("same query", num_results=2, tool=tool)
+    assert len(os.listdir(web.CACHE_DIR)) == 3
+
+
+def test_tool_results_come_from_their_own_source(mock_settings):
+    results = WebSearch(mock_settings).search("q", num_results=1, tool="news")
+    assert "/news/" in results[0].url
+
+
+def test_an_unknown_tool_is_rejected(mock_settings):
+    with pytest.raises(ValueError):
+        WebSearch(mock_settings).search("q", tool="tiktok")
+
+
+def test_web_searches_keep_their_original_cache_keys(mock_settings):
+    """Results cached before the news and papers tools existed stay valid."""
+    WebSearch(mock_settings).search("q", num_results=2)
+    assert os.path.isfile(web._cache_path("search", "q|2"))
 
 
 def test_missing_exa_key_is_a_clear_error(monkeypatch):
@@ -122,6 +132,6 @@ def test_falls_back_to_text_when_there_are_no_highlights():
     assert r.snippet == "body"
 
 
-def test_missing_title_does_not_break_citation():
+def test_missing_title_gets_a_placeholder():
     r = web._to_result(type("R", (), {"url": "u", "title": None, "highlights": []})())
-    assert "u" in r.cite()
+    assert r.title == "(untitled)"

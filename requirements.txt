@@ -1,28 +1,15 @@
-# orchestration
-langgraph
-langchain-core
-
 # llm providers
+openai            # DeepSeek and OpenRouter are OpenAI-compatible
 anthropic
 groq
-openai            # OpenRouter is OpenAI-compatible
 
 # research tools
 exa-py
-tavily-python
-trafilatura
-httpx
+mcp               # bridge to nlquery-agent
 
-# mcp (database subagent bridge)
-mcp
-
-# api
-fastapi
-uvicorn[standard]
-sse-starlette
-
-# config
 python-dotenv
-
-# ui
 chainlit
+
+# tests
+pytest
+pytest-asyncio

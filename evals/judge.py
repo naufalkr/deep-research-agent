@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
+from datetime import date
 
 from deepresearch.llm import LLMClient
 
@@ -35,9 +35,10 @@ class Verdict:
 
 
 def check_exact(answer: str, expect: list[str]) -> Verdict:
-    """Deterministic check: no model call, no cost."""
+    """Deterministic check: no model call, no cost. "USA|United States"
+    accepts either spelling."""
     text = answer.lower()
-    missing = [e for e in expect if e.lower() not in text]
+    missing = [e for e in expect if not any(alt.lower() in text for alt in e.split("|"))]
     if not missing:
         return Verdict(3, "all expected values present")
     found = len(expect) - len(missing)
@@ -47,8 +48,12 @@ def check_exact(answer: str, expect: list[str]) -> Verdict:
 
 
 def check_judge(llm: LLMClient, question: str, answer: str, expect: str) -> Verdict:
+    # Without the date the judge takes its own training cutoff for today and
+    # marks real, recent sources as invented.
     reply = llm.complete(
-        f"Question:\n{question}\n\nCriterion:\n{expect}\n\nAnswer:\n{answer}",
+        f"Today is {date.today().isoformat()}. Sources dated up to today are not "
+        f"from the future.\n\nQuestion:\n{question}\n\nCriterion:\n{expect}\n\n"
+        f"Answer:\n{answer}",
         role="critic",
         system=SYSTEM,
         agent="judge",

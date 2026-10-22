@@ -12,8 +12,7 @@ Reply with a single JSON object and nothing else:
      ],
      "contradictions": [
        {"n": [1, 4], "note": "what they disagree about"}
-     ],
-     "recheck": ["a claim worth confirming against other sources"]}
+     ]}
 
 ## Judging a claim
 
@@ -42,9 +41,7 @@ winner — the report will present the disagreement.
 Different figures for genuinely different things are not a contradiction:
 different years, different countries, different definitions.
 
-## Rechecking
-
-`recheck` is for the small number of claims that carry the answer and rest on a
-single source. Each one costs a search, so a handful at most, and only where
-being wrong would change the report's conclusion. Leave it empty when nothing
-qualifies.
+Some findings are marked `side: for` or `side: against` - they come from a
+debate. Two sides reaching different conclusions is the point of the debate,
+not a contradiction. Flag only clashing facts: two figures for the same thing,
+two accounts of the same event.

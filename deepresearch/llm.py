@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import time
 
 from . import observability
@@ -28,8 +30,26 @@ _BASE_URLS = {
 }
 
 
+def parse_json(text: str) -> dict:
+    """Pull one JSON object out of a reply, tolerating fences and stray prose."""
+    text = text.strip()
+    fenced = re.search(r"```(?:json)?\s*(.+?)\s*```", text, re.S)
+    if fenced:
+        text = fenced.group(1).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError(f"no JSON object in reply: {text[:200]}")
+    return json.loads(text[start : end + 1])
+
+
 class TruncatedResponse(RuntimeError):
-    """The model spent its whole token budget thinking and produced no text."""
+    """The model hit max_tokens: it spent the budget thinking, or ran out mid-answer."""
+
+    def __init__(self, message: str, text: str = "", prompt_tokens: int = 0, completion_tokens: int = 0):
+        super().__init__(message)
+        self.text = text
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -89,18 +109,27 @@ class LLMClient:
         start = time.perf_counter()
         budget = max_tokens
         attempt = escalations = 0
+        spent_p = spent_c = 0  # truncated attempts are billed too
         while True:
             try:
                 text, ptok, ctok = self._call(
                     model, prompt, system, budget, temperature
                 )
                 break
-            except TruncatedResponse:
+            except TruncatedResponse as exc:
                 # How much a reasoning model thinks depends on the input, so no
                 # fixed budget is right for every call. Raise it here rather
                 # than guessing a number at each call site.
+                spent_p += exc.prompt_tokens
+                spent_c += exc.completion_tokens
                 if escalations >= _MAX_ESCALATIONS:
-                    raise
+                    if not exc.text:
+                        observability.tracker.record(
+                            Call(agent or role, step, model, spent_p, spent_c, time.perf_counter() - start)
+                        )
+                        raise
+                    text, ptok, ctok = exc.text, 0, 0  # a cut-off answer beats none
+                    break
                 escalations += 1
                 budget = min(budget * 3, _TOKEN_CEILING)
             except Exception as exc:  # noqa: BLE001 - _is_retryable decides
@@ -110,7 +139,7 @@ class LLMClient:
                     continue
                 raise
         observability.tracker.record(
-            Call(agent or role, step, model, ptok, ctok, time.perf_counter() - start)
+            Call(agent or role, step, model, ptok + spent_p, ctok + spent_c, time.perf_counter() - start)
         )
         return text
 
@@ -152,11 +181,14 @@ class LLMClient:
         )
         choice = resp.choices[0]
         text = choice.message.content or ""
-        # Reasoning models spend max_tokens on thinking before writing anything,
-        # so too small a budget yields an empty string instead of an error.
-        if not text and choice.finish_reason == "length":
+        # Reasoning models spend max_tokens on thinking before writing, so too
+        # small a budget yields nothing, or an answer cut off mid-sentence.
+        if choice.finish_reason == "length":
+            what = "was cut off mid-answer" if text else "returned nothing"
             raise TruncatedResponse(
-                f"{model} used all {max_tokens} tokens on reasoning and returned "
-                f"nothing - raise max_tokens"
+                f"{model} used all {max_tokens} tokens and {what} - raise max_tokens",
+                text,
+                resp.usage.prompt_tokens,
+                resp.usage.completion_tokens,
             )
         return text, resp.usage.prompt_tokens, resp.usage.completion_tokens

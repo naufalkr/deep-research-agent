@@ -2,11 +2,10 @@ import json
 
 import pytest
 
-from deepresearch.agents import baseline
-from deepresearch.agents.baseline import BaselineAgent, _parse_action
+from deepresearch.agents.baseline import BaselineAgent
 from deepresearch.config import Settings
 from deepresearch.tools.database import DatabaseTool, DatabaseUnavailable
-from deepresearch.tools.web import SearchResult, WebSearch
+from deepresearch.tools.web import WebSearch
 
 
 @pytest.fixture
@@ -44,35 +43,15 @@ def answer(text: str) -> str:
     return json.dumps({"action": "answer", "text": text})
 
 
-def search(query: str) -> str:
-    return json.dumps({"action": "search", "query": query})
+def search(query: str, tool: str | None = None) -> str:
+    action = {"action": "search", "query": query}
+    if tool:
+        action["tool"] = tool
+    return json.dumps(action)
 
 
 def query_db(question: str) -> str:
     return json.dumps({"action": "query_database", "question": question})
-
-
-# --- action parsing ---
-
-
-def test_plain_json_is_parsed():
-    assert _parse_action('{"action": "answer", "text": "hi"}')["action"] == "answer"
-
-
-def test_markdown_fences_are_stripped():
-    assert _parse_action('```json\n{"action": "search", "query": "x"}\n```')[
-        "query"
-    ] == "x"
-
-
-def test_prose_around_the_object_is_ignored():
-    reply = 'Let me search.\n{"action": "search", "query": "x"}\nHope that helps.'
-    assert _parse_action(reply)["action"] == "search"
-
-
-def test_a_reply_with_no_object_raises():
-    with pytest.raises(ValueError):
-        _parse_action("I do not feel like answering today")
 
 
 # --- the loop ---
@@ -107,7 +86,19 @@ async def test_observations_are_fed_back_to_the_model(settings):
 async def test_database_answers_become_a_source(settings):
     result = await agent(settings, query_db("count rows"), answer("done [1]")).run("q")
     assert result.sources[0].title.startswith("internal database")
-    assert result.steps[0].action == "query_database"
+    assert result.sources[0].url == "db://chinook"
+    assert result.steps[0].action == "database"
+
+
+async def test_the_search_tool_picks_the_kind_of_source(settings):
+    result = await agent(settings, search("q", "papers"), answer("done")).run("q")
+    assert result.steps[0].action == "papers"
+    assert "/papers/" in result.sources[0].url
+
+
+async def test_an_unknown_search_tool_falls_back_to_web(settings):
+    result = await agent(settings, search("q", "tiktok"), answer("done")).run("q")
+    assert result.steps[0].action == "web"
 
 
 async def test_the_same_url_is_not_cited_twice(settings):

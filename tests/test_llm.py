@@ -192,32 +192,8 @@ def test_empty_reply_from_a_truncated_reasoning_model_raises(monkeypatch):
         "C", (), {"chat": type("Ch", (), {"completions": FakeCompletions()})()}
     )()
 
-    with pytest.raises(llm.TruncatedResponse, match="raise max_tokens"):
+    with pytest.raises(llm.TruncatedResponse, match="returned nothing"):
         client.complete("x")
-
-
-def test_a_normal_short_reply_is_not_treated_as_truncated(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "deepseek")
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
-
-    class FakeCompletions:
-        def create(self, **kwargs):
-            choice = type(
-                "C",
-                (),
-                {
-                    "message": type("M", (), {"content": "ok"})(),
-                    "finish_reason": "length",
-                },
-            )()
-            usage = type("U", (), {"prompt_tokens": 1, "completion_tokens": 1})()
-            return type("R", (), {"choices": [choice], "usage": usage})()
-
-    client = LLMClient(settings=Settings.from_env())
-    client._client = type(
-        "C", (), {"chat": type("Ch", (), {"completions": FakeCompletions()})()}
-    )()
-    assert client.complete("x") == "ok"
 
 
 class _TruncateThenSucceed:
@@ -282,3 +258,71 @@ def test_a_call_that_fits_first_time_is_not_retried(monkeypatch):
     client = _deepseek_client(monkeypatch, fake)
     assert client.complete("x", max_tokens=1000) == "ok"
     assert fake.budgets == [1000]
+
+
+class _CutOffThenSucceed:
+    """Writes half an answer until the budget clears `needs`."""
+
+    def __init__(self, needs: int):
+        self.needs = needs
+        self.budgets = []
+
+    def create(self, **kwargs):
+        self.budgets.append(kwargs["max_tokens"])
+        done = kwargs["max_tokens"] >= self.needs
+        choice = type(
+            "C",
+            (),
+            {
+                "message": type("M", (), {"content": "full answer" if done else "half an"})(),
+                "finish_reason": "stop" if done else "length",
+            },
+        )()
+        usage = type("U", (), {"prompt_tokens": 10, "completion_tokens": 100})()
+        return type("R", (), {"choices": [choice], "usage": usage})()
+
+
+def test_an_answer_cut_off_mid_sentence_is_retried_with_a_bigger_budget(monkeypatch):
+    fake = _CutOffThenSucceed(needs=3000)
+    client = _deepseek_client(monkeypatch, fake)
+    assert client.complete("x", max_tokens=1000) == "full answer"
+    assert fake.budgets == [1000, 3000]
+
+
+def test_a_cut_off_answer_beats_no_answer_once_escalation_runs_out(monkeypatch):
+    fake = _CutOffThenSucceed(needs=10**9)
+    client = _deepseek_client(monkeypatch, fake)
+    assert client.complete("x", max_tokens=1000) == "half an"
+    assert fake.budgets == [1000, 3000, 9000]
+
+
+def test_truncated_attempts_are_counted_in_the_cost(monkeypatch):
+    observability.tracker.reset()
+    client = _deepseek_client(monkeypatch, _CutOffThenSucceed(needs=3000))
+    client.complete("x", max_tokens=1000)
+    call = observability.tracker.calls[-1]
+    assert (call.prompt_tokens, call.completion_tokens) == (20, 200)
+
+
+def test_a_call_that_never_answers_still_records_what_it_cost(monkeypatch):
+    observability.tracker.reset()
+    client = _deepseek_client(monkeypatch, _TruncateThenSucceed(needs=10**9))
+    with pytest.raises(llm.TruncatedResponse):
+        client.complete("x", max_tokens=1000)
+    assert observability.tracker.calls[-1].prompt_tokens == 3
+
+
+# --- parsing replies ---
+
+
+def test_plain_json_is_parsed():
+    assert llm.parse_json('{"a": 1}') == {"a": 1}
+
+
+def test_fences_and_prose_around_the_object_are_ignored():
+    assert llm.parse_json('Sure:\n```json\n{"a": 1}\n```\nhope that helps')["a"] == 1
+
+
+def test_a_reply_with_no_object_raises():
+    with pytest.raises(ValueError):
+        llm.parse_json("I do not feel like answering today")

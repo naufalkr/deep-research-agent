@@ -11,7 +11,6 @@ def _settings(monkeypatch, **env) -> Settings:
         "SUBAGENT_MODEL",
         "SEARCH_PROVIDER",
         "EXA_API_KEY",
-        "TAVILY_API_KEY",
     ):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
@@ -57,15 +56,5 @@ def test_missing_is_empty_when_configured(monkeypatch):
 
 
 def test_mock_provider_needs_no_keys(monkeypatch):
-    s = _settings(monkeypatch, LLM_PROVIDER="mock", SEARCH_PROVIDER="groq_builtin")
+    s = _settings(monkeypatch, LLM_PROVIDER="mock", SEARCH_PROVIDER="mock")
     assert s.missing() == []
-
-
-def test_tavily_key_only_required_when_selected(monkeypatch):
-    s = _settings(
-        monkeypatch,
-        LLM_PROVIDER="mock",
-        SEARCH_PROVIDER="tavily",
-        EXA_API_KEY="ignored",
-    )
-    assert s.missing() == ["TAVILY_API_KEY"]

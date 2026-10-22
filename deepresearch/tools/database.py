@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import shlex
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
 
 from ..config import ROOT, Settings, settings as default_settings
@@ -10,15 +9,6 @@ from ..config import ROOT, Settings, settings as default_settings
 
 class DatabaseUnavailable(RuntimeError):
     """The MCP server could not be reached. Research continues without it."""
-
-
-@dataclass(frozen=True)
-class QueryResult:
-    question: str
-    answer: str
-
-    def cite(self) -> str:
-        return "internal database (nlquery-agent)"
 
 
 def _server_params(settings: Settings):
@@ -35,8 +25,17 @@ def _server_params(settings: Settings):
     if not script.is_file():
         raise DatabaseUnavailable(f"MCP server script not found: {script}")
 
+    # nlquery-agent reads its models from these; set them here to override its .env
+    env = {
+        name: value
+        for name, value in (
+            ("LLM_FAST_MODEL", settings.nlquery_fast_model),
+            ("LLM_SMART_MODEL", settings.nlquery_smart_model),
+        )
+        if value
+    }
     return StdioServerParameters(
-        command=settings.nlquery_mcp_command, args=[str(script), *args[1:]]
+        command=settings.nlquery_mcp_command, args=[str(script), *args[1:]], env=env or None
     )
 
 
@@ -63,32 +62,34 @@ class DatabaseTool:
         from mcp.client.stdio import stdio_client
 
         params = _server_params(self.settings)
+        started = False
         try:
             async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
+                    started = True
                     self._session = session
                     try:
                         yield self
                     finally:
                         self._session = None
-        except DatabaseUnavailable:
-            raise
-        except Exception as exc:  # noqa: BLE001 - any startup failure is fatal here
+        except Exception as exc:  # noqa: BLE001
+            if started:
+                # An error from the caller's block, e.g. BudgetExceeded. The MCP
+                # task groups wrap it; hand it back as itself, not as a dead database.
+                raise _unwrap(exc) from None
+            if isinstance(exc, DatabaseUnavailable):
+                raise
             raise DatabaseUnavailable(f"could not start MCP server: {exc}") from exc
 
-    async def query(self, question: str, database: str = "chinook") -> QueryResult:
+    async def query(self, question: str, database: str = "chinook") -> str:
         """Answer a question from the database. The reply carries the SQL used."""
-        answer = await self._call(
+        return await self._call(
             "query_database", {"question": question, "database": database}
         )
-        return QueryResult(question=question, answer=answer)
 
     async def schema(self, database: str = "chinook") -> str:
         return await self._call("get_schema", {"database": database})
-
-    async def tables(self, database: str = "chinook") -> str:
-        return await self._call("list_tables", {"database": database})
 
     async def databases(self) -> str:
         return await self._call("list_available_databases", {})
@@ -102,6 +103,12 @@ class DatabaseTool:
 
         result = await self._session.call_tool(tool, args)
         return _text_of(result)
+
+
+def _unwrap(exc: BaseException) -> BaseException:
+    while isinstance(exc, BaseExceptionGroup) and len(exc.exceptions) == 1:
+        exc = exc.exceptions[0]
+    return exc
 
 
 def _text_of(result) -> str:

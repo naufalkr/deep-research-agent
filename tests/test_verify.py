@@ -5,7 +5,6 @@ import pytest
 from deepresearch.agents.verify import Citer, Critic, split_sentences
 from deepresearch.config import Settings
 from deepresearch.state import Finding, SourceIndex
-from deepresearch.tools.web import WebSearch
 
 
 @pytest.fixture
@@ -132,52 +131,19 @@ async def test_a_contradiction_needs_two_valid_claims(settings):
     assert clashes == []
 
 
-# --- recheck ---
-
-
-async def test_flagged_claims_are_searched_to_warm_the_cache(settings):
-    fs = findings(1)
-    web = WebSearch(settings, seen_urls=set())
-    seen = []
-    original = web.search
-    web.search = lambda q, **kw: (seen.append(q), original(q, **kw))[1]
-    llm = ScriptedLLM(json.dumps({"verdicts": [], "recheck": ["is 4.6% right?"]}))
-    await Critic(settings, llm=llm, web=web).run(fs, index_for(fs))
-    assert seen == ["is 4.6% right?"]
-
-
-async def test_rechecks_are_capped(settings):
-    fs = findings(1)
-    web = WebSearch(settings, seen_urls=set())
-    seen = []
-    original = web.search
-    web.search = lambda q, **kw: (seen.append(q), original(q, **kw))[1]
-    llm = ScriptedLLM(json.dumps({"recheck": [f"q{i}" for i in range(9)]}))
-    await Critic(settings, llm=llm, web=web).run(fs, index_for(fs))
-    assert len(seen) == 3
-
-
-async def test_a_failing_recheck_does_not_sink_the_critic(settings):
-    class Exploding(WebSearch):
-        def search(self, query, **kw):
-            raise RuntimeError("network died")
-
-    fs = findings(1)
-    llm = ScriptedLLM(
-        json.dumps({"verdicts": [{"n": 1, "verdict": "supported"}], "recheck": ["q"]})
-    )
-    out, _ = await Critic(
-        settings, llm=llm, web=Exploding(settings, seen_urls=set())
-    ).run(fs, index_for(fs))
-    assert out[0].verdict == "supported"
-
-
 # --- sentence splitting ---
 
 
 def test_decimals_and_abbreviations_are_not_split():
     lines = split_sentences("The rate was 4.62%. It rose in the U.S. too.")
     assert lines == [["The rate was 4.62%.", "It rose in the U.S. too."]]
+
+
+def test_an_abbreviation_before_a_capital_does_not_end_the_sentence():
+    text = "U.S. Bank approved more loans, e.g. Pagaya ones. Then it stopped."
+    assert split_sentences(text) == [
+        ["U.S. Bank approved more loans, e.g. Pagaya ones.", "Then it stopped."]
+    ]
 
 
 REPORT = "## Heading\n\nOne. Two.\n- a bullet"
@@ -187,9 +153,10 @@ def test_line_structure_survives_the_round_trip():
     assert [len(x) for x in split_sentences(REPORT)] == [1, 1, 2, 1]
 
 
-def test_a_report_with_no_citations_comes_back_unchanged():
-    citer = Citer.__new__(Citer)
-    assert citer._apply(split_sentences(REPORT), {}, 5, 1) == REPORT
+async def test_a_report_with_no_citations_comes_back_unchanged(settings):
+    fs = findings(1)
+    llm = ScriptedLLM(json.dumps({"citations": []}))
+    assert await Citer(settings, llm=llm).run(REPORT, fs, index_for(fs)) == REPORT
 
 
 # --- citer ---
@@ -224,6 +191,37 @@ async def test_an_out_of_range_sentence_is_ignored(settings):
     llm = ScriptedLLM(json.dumps({"citations": [{"s": 99, "n": [1]}]}))
     out = await Citer(settings, llm=llm).run("One sentence.", fs, index_for(fs))
     assert out == "One sentence."
+
+
+async def test_the_marker_is_the_findings_source_number(settings):
+    """Findings are picked by position; the reader sees the source's number."""
+    fs = findings(2)
+    index = SourceIndex()
+    for i in range(10):
+        index.add("filler", f"https://filler.com/{i}")
+    for f in fs:
+        index.add("t", f.source_url)  # sources 11 and 12
+    llm = ScriptedLLM(json.dumps({"citations": [{"s": 1, "n": [2]}]}))
+    out = await Citer(settings, llm=llm).run("One sentence.", fs, index)
+    assert out == "One sentence. [12]"
+
+
+async def test_findings_sharing_a_page_cite_it_once(settings):
+    fs = [Finding("a", "e", "https://same.com"), Finding("b", "e", "https://same.com")]
+    llm = ScriptedLLM(json.dumps({"citations": [{"s": 1, "n": [1, 2]}]}))
+    out = await Citer(settings, llm=llm).run("One sentence.", fs, index_for(fs))
+    assert out == "One sentence. [1]"
+
+
+async def test_the_citer_lists_findings_by_position_not_source_number(settings):
+    fs = findings(1)
+    index = SourceIndex()
+    index.add("filler", "https://filler.com")
+    index.add("t", fs[0].source_url)
+    llm = ScriptedLLM(json.dumps({"citations": []}))
+    await Citer(settings, llm=llm).run("One.", fs, index)
+    assert "1. claim 1" in llm.prompts[0]
+    assert "[2]" not in llm.prompts[0]
 
 
 async def test_an_invented_finding_number_is_ignored(settings):
@@ -261,3 +259,28 @@ async def test_an_empty_report_skips_the_call(settings):
     fs = findings(1)
     assert await Citer(settings, llm=llm).run("   ", fs, index_for(fs)) == "   "
     assert llm.prompts == []
+
+
+async def test_debate_sides_are_shown_to_the_critic(settings):
+    fs = [Finding("AI cuts costs", "e", "https://a.com", stance="pro")]
+    llm = ScriptedLLM(json.dumps({"verdicts": []}))
+    await Critic(settings, llm=llm).run(fs, index_for(fs))
+    assert "side: for" in llm.prompts[0]
+
+
+async def test_findings_are_checked_in_parallel_batches(settings):
+    from deepresearch.agents.verify import BATCH
+
+    fs = findings(BATCH + 5)
+    llm = ScriptedLLM(
+        json.dumps({"verdicts": [{"n": 1, "verdict": "unsupported"}],
+                    "contradictions": [{"n": [1, 2], "note": "a"}]}),
+        json.dumps({"verdicts": [{"n": 1, "verdict": "unsupported"}],
+                    "contradictions": [{"n": [1, 2], "note": "b"}]}),
+    )
+    out, clashes = await Critic(settings, llm=llm).run(fs, index_for(fs))
+    assert len(llm.prompts) == 2
+    assert len(out) == BATCH + 5
+    # numbers are local to each batch and map back to the right finding
+    assert [i for i, f in enumerate(out) if f.verdict == "unsupported"] == [0, BATCH]
+    assert sorted(c.claims[0] for c in clashes) == ["claim 1", f"claim {BATCH + 1}"]
