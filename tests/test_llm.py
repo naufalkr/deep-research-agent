@@ -312,6 +312,41 @@ def test_a_call_that_never_answers_still_records_what_it_cost(monkeypatch):
     assert observability.tracker.calls[-1].prompt_tokens == 3
 
 
+class _EmptyThenSucceed:
+    """Finishes with no text (as DeepSeek does under load) `empties` times."""
+
+    def __init__(self, empties: int):
+        self.empties = empties
+        self.calls = 0
+
+    def create(self, **kwargs):
+        self.calls += 1
+        content = "" if self.calls <= self.empties else "the report"
+        choice = type(
+            "C", (), {"message": type("M", (), {"content": content})(), "finish_reason": "stop"}
+        )()
+        usage = type("U", (), {"prompt_tokens": 10, "completion_tokens": 5})()
+        return type("R", (), {"choices": [choice], "usage": usage})()
+
+
+def test_an_empty_reply_is_retried_not_returned(monkeypatch):
+    """Two debate verdicts came back as empty strings with finish_reason "stop"."""
+    monkeypatch.setattr(llm.time, "sleep", lambda _: None)
+    fake = _EmptyThenSucceed(empties=2)
+    client = _deepseek_client(monkeypatch, fake)
+    assert client.complete("x") == "the report"
+    assert fake.calls == 3
+
+
+def test_an_empty_reply_that_never_recovers_raises(monkeypatch):
+    monkeypatch.setattr(llm.time, "sleep", lambda _: None)
+    observability.tracker.reset()
+    client = _deepseek_client(monkeypatch, _EmptyThenSucceed(empties=99))
+    with pytest.raises(llm.EmptyReply, match="empty reply"):
+        client.complete("x")
+    assert observability.tracker.calls[-1].prompt_tokens == 10 * (llm._MAX_RETRIES + 1)
+
+
 # --- parsing replies ---
 
 

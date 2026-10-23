@@ -396,3 +396,22 @@ async def test_a_broken_listener_does_not_lose_the_research(settings):
 
     result = await graph(settings, RoutingLLM(steps()), on_event=on_event).run("q")
     assert result.answer
+
+
+async def test_a_budget_stop_leaves_the_graph_as_itself(settings):
+    """The CLI, UI and eval catch BudgetExceeded by type; LangGraph must not wrap it."""
+    from deepresearch.observability import BudgetExceeded
+
+    class Broke(RoutingLLM):
+        async def acomplete(self, prompt, **kwargs):
+            if kwargs.get("step") == "synthesize":
+                raise BudgetExceeded("over budget")
+            return await super().acomplete(prompt, **kwargs)
+
+    with pytest.raises(BudgetExceeded):
+        await graph(settings, Broke(steps())).run("q")
+
+
+def test_the_run_is_a_langgraph_state_graph(settings):
+    g = graph(settings, RoutingLLM(steps()))
+    assert set(g.graph.get_graph().nodes) >= {"plan", "child", "next_round", "check", "write", "cite"}

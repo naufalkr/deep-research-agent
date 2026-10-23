@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import operator
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Annotated, TypedDict
+
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
 
 from .agents.child import Child
 from .agents.lead import Lead
@@ -13,6 +18,7 @@ from .state import (
     Contradiction,
     Finding,
     Mode,
+    Plan,
     Source,
     SourceIndex,
     SubTask,
@@ -22,6 +28,34 @@ from .tools.database import DatabaseTool
 from .tools.web import WebSearch
 
 Listener = Callable[[str, dict], Awaitable[None]]
+
+
+def _merge(a: dict, b: dict) -> dict:
+    return {**a, **b}
+
+
+class Job(TypedDict):
+    """What one child is sent: its task, and in a rebuttal the other side's findings."""
+
+    task: SubTask
+    opponent: list[Finding] | None
+    index: SourceIndex
+
+
+class State(TypedDict, total=False):
+    question: str
+    index: SourceIndex  # shared, so a page found by two children gets one number
+    plan: Plan
+    round: int
+    pending: list[Job]  # children to send next; empty means move on to checking
+    # children run in parallel and all write here, so these are merged, not replaced
+    tasks: Annotated[list[SubTask], operator.add]
+    findings: Annotated[list[Finding], operator.add]
+    failures: Annotated[dict[str, str], _merge]
+    checked: list[Finding]
+    contradictions: list[Contradiction]
+    answer: str
+    sources: list[Source]
 
 
 @dataclass
@@ -47,10 +81,13 @@ class MultiAgentResult:
 
 
 class ResearchGraph:
-    """lead plans -> children research in parallel -> second round -> check -> write -> cite.
+    """The research run as a LangGraph StateGraph:
 
-    The second round depends on the mode: in facts mode the lead looks for
-    parts nothing answered; in debate mode each side rebuts the other.
+        plan -> child x N (parallel) -> next_round -+-> child x N ...
+                                                    +-> check -> write -> cite
+
+    next_round depends on the mode: in facts mode the lead looks for parts
+    nothing answered; in debate mode each side rebuts the other, once.
     """
 
     def __init__(
@@ -70,78 +107,149 @@ class ResearchGraph:
         self.critic = Critic(self.settings, llm=self.llm)
         self.citer = Citer(self.settings, llm=self.llm)
         self.on_event = on_event
+        self.graph = self._build()
+
+    def _build(self):
+        g = StateGraph(State)
+        g.add_node("plan", self._plan)
+        g.add_node("child", self._child)
+        g.add_node("next_round", self._next_round)
+        g.add_node("check", self._check)
+        g.add_node("write", self._write)
+        g.add_node("cite", self._cite)
+        g.add_edge(START, "plan")
+        g.add_conditional_edges("plan", self._dispatch, ["child", "check"])
+        g.add_edge("child", "next_round")  # runs once every child of the round is done
+        g.add_conditional_edges("next_round", self._dispatch, ["child", "check"])
+        g.add_edge("check", "write")
+        g.add_edge("write", "cite")
+        g.add_edge("cite", END)
+        return g.compile()
 
     async def run(self, question: str) -> MultiAgentResult:
-        index = SourceIndex()
-        failures: dict[str, str] = {}
         await self._emit("start", question=question)
-
-        plan = await self.lead.plan(question)
-        await self._emit("planned", plan=plan)
-        tasks = list(plan.tasks)
-        findings = await self._fan_out(tasks, index, failures)
-
-        rounds = 1
-        if plan.mode == "debate":
-            rebuttals = self._rebuttal_tasks(plan.tasks, findings)
-            if rebuttals:
-                rounds = 2
-                await self._emit("rebuttal", tasks=[t for t, _ in rebuttals])
-                tasks += [t for t, _ in rebuttals]
-                findings += await self._fan_out(rebuttals, index, failures)
-        else:
-            while rounds < self.settings.max_research_rounds:
-                gaps = await self.lead.review(question, findings, index, round_no=rounds + 1)
-                await self._emit("reviewed", round=rounds, gaps=gaps)
-                if not gaps:
-                    break
-                rounds += 1
-                tasks += gaps
-                findings += await self._fan_out(gaps, index, failures)
-
-        # Checking and citing improve a report; losing them must not cost it.
-        contradictions: list[Contradiction] = []
-        try:
-            findings, contradictions = await self.critic.run(findings, index)
-            await self._emit("verified", findings=findings, contradictions=contradictions)
-        except Exception as exc:  # noqa: BLE001
-            failures["critic"] = f"{type(exc).__name__}: {exc}"
-
-        await self._emit("writing")
-        answer = await self.lead.synthesize(question, plan, findings, index, contradictions)
-        sources = list(index.sources)
-        try:
-            answer = await self.citer.run(answer, findings, index)
-            answer, sources = compact_citations(answer, sources)
-        except Exception as exc:  # noqa: BLE001
-            failures["citer"] = f"{type(exc).__name__}: {exc}"
-
+        s = await self.graph.ainvoke(
+            {"question": question, "index": SourceIndex(), "tasks": [], "findings": [], "failures": {}}
+        )
+        plan, findings = s["plan"], s["checked"]
         return MultiAgentResult(
             question=question,
-            answer=answer.strip(),
+            answer=s["answer"].strip(),
             mode=plan.mode,
             motion=plan.motion,
             complexity=plan.complexity,
-            plan=tasks,
+            plan=s["tasks"],
             findings=findings,
-            sources=sources,
-            contradictions=contradictions,
-            failures=failures,
-            rounds=rounds,
-            ok=bool(findings) and not failures,
+            sources=s["sources"],
+            contradictions=s["contradictions"],
+            failures=s["failures"],
+            rounds=s["round"],
+            ok=bool(findings) and not s["failures"],
         )
 
+    # --- nodes ---------------------------------------------------------------
+
+    async def _plan(self, s: State) -> dict:
+        plan = await self.lead.plan(s["question"])
+        await self._emit("planned", plan=plan)
+        return {
+            "plan": plan,
+            "round": 1,
+            "tasks": plan.tasks,
+            "pending": [self._job(s, t) for t in plan.tasks],
+        }
+
+    async def _child(self, job: Job) -> dict:
+        task = job["task"]
+        child = Child(
+            self.settings,
+            llm=self.llm,
+            web=self.web or WebSearch(self.settings),
+            database=self.database,
+            index=job["index"],
+        )
+        await self._emit("child_start", task=task)
+        try:
+            found = await asyncio.wait_for(
+                child.run(task, job["opponent"]), timeout=self.settings.subagent_timeout_s
+            )
+        except asyncio.TimeoutError:
+            reason = f"timed out after {self.settings.subagent_timeout_s:.0f}s"
+            await self._emit("child_failed", task=task, reason=reason)
+            return {"failures": {task.id: reason}}
+        except Exception as exc:  # noqa: BLE001 - one dead child narrows the research
+            await self._emit("child_failed", task=task, reason=str(exc))
+            return {"failures": {task.id: f"{type(exc).__name__}: {exc}"}}
+        await self._emit("child_done", task=task, findings=found)
+        return {"findings": found}
+
+    async def _next_round(self, s: State) -> dict:
+        plan, findings, round_no = s["plan"], s["findings"], s["round"]
+
+        if plan.mode == "debate":
+            if round_no > 1:
+                return {"pending": []}
+            rebuttals = []
+            for task in plan.tasks:  # each side answers what the other side found
+                opponent = [f for f in findings if f.stance not in (task.stance, "neutral")]
+                if opponent:
+                    rebuttals.append((SubTask(f"{task.id}-2", task.objective, task.stance), opponent))
+            if not rebuttals:
+                return {"pending": []}
+            await self._emit("rebuttal", tasks=[t for t, _ in rebuttals])
+            return {
+                "round": 2,
+                "tasks": [t for t, _ in rebuttals],
+                "pending": [self._job(s, t, opp) for t, opp in rebuttals],
+            }
+
+        # A plan made once and never checked leaves whatever it overlooked missing.
+        if round_no >= self.settings.max_research_rounds:
+            return {"pending": []}
+        gaps = await self.lead.review(s["question"], findings, s["index"], round_no=round_no + 1)
+        await self._emit("reviewed", round=round_no, gaps=gaps)
+        if not gaps:
+            return {"pending": []}
+        return {"round": round_no + 1, "tasks": gaps, "pending": [self._job(s, g) for g in gaps]}
+
+    async def _check(self, s: State) -> dict:
+        # Checking and citing improve a report; losing them must not cost it.
+        try:
+            checked, contradictions = await self.critic.run(s["findings"], s["index"])
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "checked": s["findings"],
+                "contradictions": [],
+                "failures": {"critic": f"{type(exc).__name__}: {exc}"},
+            }
+        await self._emit("verified", findings=checked, contradictions=contradictions)
+        return {"checked": checked, "contradictions": contradictions}
+
+    async def _write(self, s: State) -> dict:
+        await self._emit("writing")
+        answer = await self.lead.synthesize(
+            s["question"], s["plan"], s["checked"], s["index"], s["contradictions"]
+        )
+        return {"answer": answer}
+
+    async def _cite(self, s: State) -> dict:
+        try:
+            answer = await self.citer.run(s["answer"], s["checked"], s["index"])
+        except Exception as exc:  # noqa: BLE001 - ship it uncited rather than not at all
+            return {"sources": list(s["index"].sources), "failures": {"citer": f"{type(exc).__name__}: {exc}"}}
+        answer, sources = compact_citations(answer, s["index"].sources)
+        return {"answer": answer, "sources": sources}
+
+    # --- helpers -------------------------------------------------------------
+
     @staticmethod
-    def _rebuttal_tasks(
-        sides: list[SubTask], findings: list[Finding]
-    ) -> list[tuple[SubTask, list[Finding]]]:
-        """Each side gets a second turn to answer what the other side found."""
-        out = []
-        for task in sides:
-            opponent = [f for f in findings if f.stance not in (task.stance, "neutral")]
-            if opponent:
-                out.append((SubTask(f"{task.id}-2", task.objective, task.stance), opponent))
-        return out
+    def _dispatch(s: State):
+        """Send every pending child in parallel, or move on to checking."""
+        return [Send("child", job) for job in s.get("pending", [])] or "check"
+
+    @staticmethod
+    def _job(s: State, task: SubTask, opponent: list[Finding] | None = None) -> Job:
+        return {"task": task, "opponent": opponent, "index": s["index"]}
 
     async def _emit(self, kind: str, **data) -> None:
         if self.on_event is None:
@@ -150,48 +258,3 @@ class ResearchGraph:
             await self.on_event(kind, data)
         except Exception:  # noqa: BLE001 - a UI hiccup must not lose the research
             pass
-
-    async def _fan_out(self, work: list, index: SourceIndex, failures: dict[str, str]) -> list[Finding]:
-        """Run children in parallel. `work` holds tasks, or (task, opponent) pairs."""
-        jobs = [w if isinstance(w, tuple) else (w, None) for w in work]
-        results = await asyncio.gather(
-            *(self._run_child(task, opponent, index, failures) for task, opponent in jobs),
-            return_exceptions=True,
-        )
-        findings: list[Finding] = []
-        for (task, _), outcome in zip(jobs, results):
-            if isinstance(outcome, BaseException):
-                failures[task.id] = f"{type(outcome).__name__}: {outcome}"
-            else:
-                findings.extend(outcome)
-        return findings
-
-    async def _run_child(
-        self,
-        task: SubTask,
-        opponent: list[Finding] | None,
-        index: SourceIndex,
-        failures: dict[str, str],
-    ) -> list[Finding]:
-        child = Child(
-            self.settings,
-            llm=self.llm,
-            web=self.web or WebSearch(self.settings),
-            database=self.database,
-            index=index,
-        )
-        await self._emit("child_start", task=task)
-        try:
-            found = await asyncio.wait_for(
-                child.run(task, opponent), timeout=self.settings.subagent_timeout_s
-            )
-        except asyncio.TimeoutError:
-            reason = f"timed out after {self.settings.subagent_timeout_s:.0f}s"
-            failures[task.id] = reason
-            await self._emit("child_failed", task=task, reason=reason)
-            return []
-        except Exception as exc:
-            await self._emit("child_failed", task=task, reason=str(exc))
-            raise
-        await self._emit("child_done", task=task, findings=found)
-        return found

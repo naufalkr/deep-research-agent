@@ -25,3 +25,4 @@ web/.vite/
 # personal notes and the local chainlit readme
 docs/new-concept.md
 chainlit.md
+docs/eval-log.md

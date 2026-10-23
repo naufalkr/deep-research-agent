@@ -52,7 +52,18 @@ class TruncatedResponse(RuntimeError):
         self.completion_tokens = completion_tokens
 
 
+class EmptyReply(RuntimeError):
+    """The model finished without writing anything, e.g. DeepSeek under load."""
+
+    def __init__(self, message: str, prompt_tokens: int = 0, completion_tokens: int = 0):
+        super().__init__(message)
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+
+
 def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, EmptyReply):
+        return True
     name = type(exc).__name__
     if any(k in name for k in ("RateLimit", "Timeout", "Connection", "APIStatus")):
         return True
@@ -133,10 +144,16 @@ class LLMClient:
                 escalations += 1
                 budget = min(budget * 3, _TOKEN_CEILING)
             except Exception as exc:  # noqa: BLE001 - _is_retryable decides
+                spent_p += getattr(exc, "prompt_tokens", 0)
+                spent_c += getattr(exc, "completion_tokens", 0)
                 if _is_retryable(exc) and attempt < _MAX_RETRIES:
                     attempt += 1
                     time.sleep(min(2**attempt, 8))
                     continue
+                if spent_p or spent_c:
+                    observability.tracker.record(
+                        Call(agent or role, step, model, spent_p, spent_c, time.perf_counter() - start)
+                    )
                 raise
         observability.tracker.record(
             Call(agent or role, step, model, ptok + spent_p, ctok + spent_c, time.perf_counter() - start)
@@ -167,6 +184,12 @@ class LLMClient:
                 **kwargs,
             )
             text = "".join(b.text for b in resp.content if b.type == "text")
+            if not text.strip():
+                raise EmptyReply(
+                    f"{model} returned an empty reply ({resp.stop_reason})",
+                    resp.usage.input_tokens,
+                    resp.usage.output_tokens,
+                )
             return text, resp.usage.input_tokens, resp.usage.output_tokens
 
         messages = []
@@ -188,6 +211,13 @@ class LLMClient:
             raise TruncatedResponse(
                 f"{model} used all {max_tokens} tokens and {what} - raise max_tokens",
                 text,
+                resp.usage.prompt_tokens,
+                resp.usage.completion_tokens,
+            )
+        # An empty reply is never an answer, whatever the finish reason says.
+        if not text.strip():
+            raise EmptyReply(
+                f"{model} returned an empty reply ({choice.finish_reason})",
                 resp.usage.prompt_tokens,
                 resp.usage.completion_tokens,
             )

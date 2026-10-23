@@ -33,43 +33,34 @@ Debate  "should banks use AI to approve loans?"
              -> verdict
 ```
 
-Before the report is written, every finding is checked against its own
-evidence, and a separate pass attaches the citations so they can't be made up.
-
-**Why not one agent?** One agent can loop and search again - it's the baseline
-below, with the same four tools. It reads everything in one context and tends
-to follow whichever thread it found first. Splitting the work keeps each part
-of a question covered, and gives a judgement question a real case on both
-sides. It costs more and takes longer, so simple lookups still get a single
-child.
+The flow is a [LangGraph](https://github.com/langchain-ai/langgraph) `StateGraph`:
+each step is a node, the children run in parallel through `Send`, and the
+mode decides whether another round runs. Agents, prompts and tools are plain
+Python - no LangChain.
 
 ## Results
 
-Same questions, same tools, same models (DeepSeek V4), graded by an LLM judge
-from 0 to 3 (exact match for database figures). 17 questions; the last 5 of
-the 22-question set did not run because the API balance ran out.
+22 questions, same tools and models (DeepSeek V4) for both, graded by an LLM
+judge from 0 to 3 (exact match for database figures). The single agent is the
+baseline: one agent, one loop, the same four tools.
 
 | | Questions | Single agent | Multi-agent |
 |---|---|---|---|
 | Simple lookups | 10 | 2.90 | 2.70 |
 | Multi-part | 5 | 3.00 | 2.80 |
-| Judgement (debate) | 2 | 2.50 | **3.00** |
-| **All** | 17 | **2.88** | 2.76 |
-| Passed (score 2+) | | 17/17 | 17/17 |
-| Cost / question | | $0.02 | $0.05 |
-| Time / question | | 2 min | 8 min |
+| News + papers | 2 | 1.50* | 2.50 |
+| Judgement (debate) | 5 | 2.80 | 2.80 |
+| **All** | 22 | 2.77 | 2.73 |
+| Passed (score 2+) | | 21/22 | 22/22 |
+| Cost / question | | $0.02 | $0.06 |
+| Time / question | | 2 min | 8.5 min |
 
-The lead picked the right mode on all 16 questions that have one.
+The lead picked the right mode on all 21 questions that have one.
 
-Honest reading: with the same tools, the single agent is as good on lookups and
-multi-part questions, and much cheaper and faster. The debate mode made the
-difference on one of the two judgement questions: asked about restricting
-paylater, the single agent argued one side and said it had no evidence for the
-other. Of the multi-agent's three lost points, one was a bug (a report cut off
-mid-sentence, since fixed) and two were answer quality. Seventeen questions,
-one run each, so a 0.1 difference is within noise.
-
-Details and earlier versions: [docs/eval-log.md](docs/eval-log.md)
+Honest reading: with the same tools, one agent is about as good and much
+cheaper and faster - multi-agent did not beat it here. One run per question,
+so differences of 0.1-0.2 are noise. Two debate answers came back empty from
+the API and were rerun after a fix (empty replies are now retried).
 
 ## Run it
 
@@ -106,7 +97,7 @@ python -m evals.compare baseline multiagent
 
 ```text
 deepresearch/
-  graph.py          the run: plan -> children -> second round -> check -> write
+  graph.py          LangGraph flow: plan -> children -> next round -> check -> write
   agents/lead.py    plans, checks coverage, writes
   agents/child.py   the research agent and its tools
   agents/verify.py  claim check and citation pass

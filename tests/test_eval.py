@@ -62,6 +62,11 @@ def test_only_filter_matches_by_prefix():
     assert load_cases("nope-") == []
 
 
+def test_only_filter_takes_several_prefixes():
+    ids = [c["id"] for c in load_cases("debate-nuclear, sources-")]
+    assert ids == ["debate-nuclear-id", "sources-deepfake", "sources-lending"]
+
+
 def test_exact_check_passes_when_every_value_is_present():
     v = check_exact("Iron Maiden leads with 213 tracks", ["Iron Maiden", "213"])
     assert v.score == 3 and v.passed

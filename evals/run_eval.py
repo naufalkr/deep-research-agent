@@ -2,7 +2,7 @@
 
     python -m evals.run_eval --agent multiagent --tag v1.0
     python -m evals.run_eval --agent baseline --tag v1.0-baseline
-    python -m evals.run_eval --only debate-        # id prefix filter
+    python -m evals.run_eval --only debate-,sources-   # id prefixes, comma-separated
 
 Results land in runs/evals/<tag>.json; compare two with evals.compare.
 """
@@ -35,7 +35,8 @@ def load_cases(only: str | None) -> list[dict]:
         for line in QUESTIONS.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    return [c for c in cases if not only or c["id"].startswith(only)]
+    prefixes = tuple(p.strip() for p in only.split(",")) if only else ("",)
+    return [c for c in cases if c["id"].startswith(prefixes)]
 
 
 async def run_case(case: dict, agent: str) -> dict:
@@ -99,7 +100,7 @@ async def main() -> int:
     parser = argparse.ArgumentParser(prog="evals.run_eval")
     parser.add_argument("--agent", choices=("baseline", "multiagent"), default="multiagent")
     parser.add_argument("--tag", default="latest", help="name for the saved results")
-    parser.add_argument("--only", help="run only ids starting with this")
+    parser.add_argument("--only", help="run only ids starting with these (comma-separated)")
     args = parser.parse_args()
 
     cases = load_cases(args.only)
